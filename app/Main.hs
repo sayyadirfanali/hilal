@@ -8,6 +8,6 @@ import Hilal.Migrate (migrate)
 main :: IO ()
 main = do
   withDb "hilal.db" migrate
-  application <- app
+  application <- app "./hilal.db"
   putStrLn "hilal listening on http://localhost:8080"
   run 8080 application

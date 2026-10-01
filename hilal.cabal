@@ -2,24 +2,28 @@ cabal-version: 3.0
 name:          hilal
 version:       0.1.0.0
 build-type:    Simple
-extra-source-files: schema.sql
+extra-source-files: schema.sql, static/*.css
 
 common shared
   default-language:   GHC2021
-  default-extensions: DataKinds, OverloadedStrings
+  default-extensions: AllowAmbiguousTypes, DataKinds, OverloadedStrings, TemplateHaskell
   ghc-options:        -Wall -Wcompat
   build-depends:      base >=4.17 && <5
 
 library
   import:          shared
   hs-source-dirs:  src
-  exposed-modules: Hilal.App
-                   Hilal.DB
-                   Hilal.Migrate
-                   Hilal.Query
-                   Hilal.Types
+  exposed-modules:
+    Hilal.App
+    Hilal.DB
+    Hilal.Migrate
+    Hilal.Query
+    Hilal.Types
+    Hilal.Views
   build-depends:   bytestring
                  , direct-sqlite
+                 , http-types
+                 , lucid2
                  , file-embed
                  , sqlite-simple
                  , scotty
@@ -45,3 +49,7 @@ test-suite hilal-test
                 , hspec-wai
                 , sqlite-simple
                 , time
+                , lucid2
+                , text
+                , wai
+                , temporary

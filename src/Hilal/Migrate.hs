@@ -1,5 +1,3 @@
-{-# LANGUAGE TemplateHaskell #-}
-
 module Hilal.Migrate (migrate) where
 
 import Data.FileEmbed (embedFile)

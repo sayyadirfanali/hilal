@@ -1,15 +1,33 @@
 module Main (main) where
 
 import Control.Monad (forM_)
+import Data.Text.Encoding (encodeUtf8)
 import Data.Time (TimeOfDay (..), UTCTime (..), fromGregorian)
 import Database.SQLite.Simple (Connection, Only (..), execute, execute_, query_)
+import Lucid (renderText)
+import Network.Wai (Application)
+import System.IO.Temp (emptySystemTempFile)
 import Test.Hspec
 import Test.Hspec.Wai
+import Data.Text.Lazy qualified as TL
+
 import Hilal.App (app)
 import Hilal.DB (withDb)
 import Hilal.Migrate (migrate)
 import Hilal.Query
 import Hilal.Types
+import Hilal.Views (clockDigits, clockPeriod, mosquePage, stylesheetPath)
+
+testApp :: IO Application
+testApp = do
+  path <- emptySystemTempFile "hilal-test.db"
+  withDb path $ \conn -> do
+    migrate conn
+    execute_ conn
+      "INSERT INTO mosques (id, name, address, lat, lng, timezone) \
+      \VALUES (1, 'Jama Masjid', 'Old Delhi', 28.6507, 77.2334, 'Asia/Kolkata')"
+    saveTiming conn noon (MosqueId 1) Fajr (timesAt 5)
+  app path
 
 withTestDb :: (Connection -> IO a) -> IO a
 withTestDb action =
@@ -114,7 +132,51 @@ main = hspec $ do
           \VALUES (1, 'fajr', '5:30am', '05:45', '2026-01-01T00:00:00Z')"
         getTimings conn (MosqueId 1) `shouldThrow` anyException
 
-  with app $
+  describe "views" $ do
+    let mosque = Mosque (MosqueId 1) "Jama Masjid" "Old Delhi" 0 0 "Asia/Kolkata"
+
+    it "shows the mosque's name" $
+      renderText (mosquePage mosque []) `shouldSatisfy` TL.isInfixOf "Jama Masjid"
+
+    it "escapes names, so admins can't inject HTML" $
+      renderText (mosquePage mosque { mosqueName = "<b>x</b>" } [])
+        `shouldSatisfy` (not . TL.isInfixOf "<b>x</b>")
+
+    it "shows morning times in 12-hour format" $
+      (clockDigits (TimeOfDay 5 5 0), clockPeriod (TimeOfDay 5 5 0))
+        `shouldBe` ("5:05", "AM")
+
+    it "shows just past midnight as 12, AM" $
+      (clockDigits (TimeOfDay 0 15 0), clockPeriod (TimeOfDay 0 15 0))
+        `shouldBe` ("12:15", "AM")
+
+    it "shows just past noon as 12, PM" $
+      (clockDigits (TimeOfDay 12 30 0), clockPeriod (TimeOfDay 12 30 0))
+        `shouldBe` ("12:30", "PM")
+
+  with testApp $ do
     describe "GET /health" $
       it "responds with ok" $
         get "/health" `shouldRespondWith` "ok"
+
+    describe "GET /mosques/:id" $ do
+      it "shows an existing mosque" $
+        get "/mosques/1" `shouldRespondWith` 200
+
+      it "is 404 for a missing mosque" $
+        get "/mosques/99" `shouldRespondWith` 404
+
+      it "is 404 for an id that isn't a number" $
+        get "/mosques/abc" `shouldRespondWith` 404
+
+    describe "the stylesheet" $ do
+      it "is served at its fingerprinted URL, cached for a year" $
+        get (encodeUtf8 stylesheetPath) `shouldRespondWith` 200
+          { matchHeaders = ["Cache-Control" <:> "public, max-age=31536000, immutable"] }
+
+      it "is served for any fingerprint, so pages open before a deploy keep working" $
+        get "/static/old-hash/app.css" `shouldRespondWith` 200
+
+    describe "unknown URLs" $
+      it "are 404" $
+        get "/no-such-page" `shouldRespondWith` 404
