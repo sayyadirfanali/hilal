@@ -2,13 +2,21 @@ module Hilal.Query
   ( getMosque
   , getTimings
   , saveTiming
+  , searchMosques
+  , getLastUpdated
   ) where
 
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Time (UTCTime, defaultTimeLocale, formatTime)
+import Data.Time (UTCTime, defaultTimeLocale, formatTime, parseTimeM)
 import Database.SQLite.Simple (Connection, Only (..), execute, query, (:.) (..))
+
 import Hilal.Types
+    ( MosqueId,
+      Mosque,
+      Prayer,
+      PrayerTime(ptJamaat, ptAzan),
+      formatClock )
 
 getMosque :: Connection -> MosqueId -> IO (Maybe Mosque)
 getMosque conn mid = do
@@ -39,3 +47,22 @@ saveTiming conn now mid p t =
 
 timestamp :: UTCTime -> Text
 timestamp = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+
+searchMosques :: Connection -> Int -> Text -> IO [Mosque]
+searchMosques conn limit q =
+  query conn
+    "SELECT id, name, address, lat, lng, timezone FROM mosques \
+    \WHERE (SELECT COUNT(*) FROM timings WHERE timings.mosque_id = mosques.id) = ? \
+    \  AND (instr(lower(name), lower(?)) > 0 OR instr(lower(address), lower(?)) > 0) \
+    \ORDER BY name COLLATE NOCASE \
+    \LIMIT ?"
+    (prayerCount, q, q, limit)
+  where
+    prayerCount = length [minBound .. maxBound :: Prayer]
+
+getLastUpdated :: Connection -> MosqueId -> IO (Maybe UTCTime)
+getLastUpdated conn mid = do
+  rows <- query conn "SELECT MAX(updated_at) FROM timings WHERE mosque_id = ?" (Only mid)
+  return $ case rows of
+    [Only (Just t)] -> parseTimeM False defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack t)
+    _               -> Nothing

@@ -3,6 +3,7 @@ module Hilal.Types
   , prayerToText
   , prayerFromText
   , PrayerTime (..)
+  , hasAllTimings
   , parseClock
   , formatClock
   , MosqueId (..)
@@ -70,6 +71,9 @@ parseClock = parseTimeM False defaultTimeLocale "%H:%M" . T.unpack
 
 formatClock :: TimeOfDay -> Text
 formatClock = T.pack . formatTime defaultTimeLocale "%H:%M"
+
+hasAllTimings :: [(Prayer, PrayerTime)] -> Bool
+hasAllTimings timings = all (`elem` map fst timings) [minBound .. maxBound]
 
 newtype MosqueId = MosqueId Int64
   deriving (Show, Eq, Ord, FromField, ToField)

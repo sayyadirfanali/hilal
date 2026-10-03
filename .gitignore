@@ -1,3 +1,5 @@
+vendor/
+static/app.gen.css
 dist-newstyle/
 *.db
 *.db-wal

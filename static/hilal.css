@@ -20,3 +20,32 @@
   font-weight: 400;
   color: var(--pico-muted-color);
 }
+
+.mosques {
+  padding: 0;
+}
+
+.mosques li {
+  list-style: none;
+  margin: 0;
+  border-bottom: var(--pico-border-width) solid var(--pico-muted-border-color);
+}
+
+.mosques a {
+  display: block;
+  padding: var(--pico-spacing) 0;
+  text-decoration: none;
+}
+
+.mosques strong,
+.mosques small {
+  display: block;
+}
+
+.mosques small {
+  color: var(--pico-muted-color);
+}
+
+.more {
+  color: var(--pico-muted-color);
+}

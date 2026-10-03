@@ -1,8 +1,9 @@
 module Hilal.DB (openDb, withDb) where
 
-import Control.Exception (bracket)
+import Control.Exception ( bracket )
 import qualified Database.SQLite3 as Direct
-import Database.SQLite.Simple (Connection, close, connectionHandle, open)
+import Database.SQLite.Simple
+    ( Connection(connectionHandle), close, open )
 
 openDb :: FilePath -> IO Connection
 openDb path = do
