@@ -1,8 +1,8 @@
-vendor/
-static/app.gen.css
-dist-newstyle/
 *.db
-*.db-wal
 *.db-shm
+*.db-wal
+*.log
 .env
-_*
+dist-newstyle/
+static/app.gen.css
+vendor/
