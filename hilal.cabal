@@ -16,7 +16,9 @@ library
   exposed-modules:
     Hilal.App
     Hilal.Assets
+    Hilal.Auth
     Hilal.DB
+    Hilal.Edit
     Hilal.JSON
     Hilal.Migrate
     Hilal.Query
@@ -25,6 +27,8 @@ library
     Hilal.Views
   build-depends:   aeson
                  , bytestring
+                 , cookie
+                 , crypton
                  , direct-sqlite
                  , http-types
                  , lucid2
@@ -42,6 +46,7 @@ executable hilal
   hs-source-dirs: app
   main-is:        Main.hs
   build-depends:  hilal
+                , text
                 , warp
   ghc-options:    -threaded -rtsopts -with-rtsopts=-N
 
@@ -52,8 +57,10 @@ test-suite test
   main-is:        Tests.hs
   build-depends:  hilal
                 , aeson
+                , bytestring
                 , hspec
                 , hspec-wai
+                , http-types
                 , sqlite-simple
                 , time
                 , lucid2

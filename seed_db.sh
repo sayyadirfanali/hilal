@@ -2,8 +2,9 @@
 set -eu
 
 db=hilal.db
+email="${HILAL_EMAIL:-you@example.com}"
 
-rm -f "$db" "$db-wal" "$db-shm"
+rm -f "$db" "$db-wal" "$db-shm" edits.log
 sqlite3 "$db" < schema.sql
 
 sqlite3 "$db" <<'SQL'
@@ -52,6 +53,10 @@ SET lat = round(lat + (id * 37 % 200 - 100) / 10000.0, 4),
     lng = round(lng + (id * 53 % 200 - 100) / 10000.0, 4)
 WHERE id > 3;
 
+UPDATE mosques
+SET lat = NULL, lng = NULL
+WHERE id > 3 AND id % 11 = 0;
+
 INSERT INTO timings (mosque_id, prayer, azan_time, jamaat_time, updated_at)
 SELECT
   m.id,
@@ -68,10 +73,28 @@ CROSS JOIN (VALUES
   ('isha',    '19:30'),
   ('jumuah',  '13:15')
 ) AS p
-WHERE m.id NOT IN (3)
+WHERE m.id <> 3
   AND (m.id <= 3 OR m.id % 7 <> 0);
+
+INSERT INTO users (email, blocked, created_at) VALUES
+  ('blocked@example.com', 1, '2026-10-03T00:00:00Z');
 
 COMMIT;
 SQL
 
-echo "$db: $(sqlite3 "$db" 'SELECT COUNT(*) FROM mosques') mosques"
+sqlite3 "$db" <<SQL
+BEGIN;
+
+INSERT INTO users (email, created_at) VALUES
+  (lower('$email'), '2026-10-03T00:00:00Z');
+
+INSERT INTO follows (user_id, mosque_id, created_at)
+SELECT users.id, m.column1, '2026-10-03T00:00:00Z'
+FROM users
+CROSS JOIN (VALUES (1), (2), (4), (5)) AS m
+WHERE users.email = lower('$email');
+
+COMMIT;
+SQL
+
+echo "$db: $(sqlite3 "$db" 'SELECT COUNT(*) FROM mosques') mosques, following 4 as $email"
