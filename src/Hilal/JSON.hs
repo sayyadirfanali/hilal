@@ -1,6 +1,8 @@
 module Hilal.JSON
   ( timingsJson
+  , followedJson
   , notFoundJson
+  , notSignedInJson
   ) where
 
 import Data.Aeson (Value, encode, object, (.=))
@@ -32,5 +34,18 @@ timingsJson mosque timings =
         , "jamaat" .= formatClock (ptJamaat t)
         ]
 
+followedJson :: [Mosque] -> Value
+followedJson mosques =
+  object ["mosques" .= map entry mosques]
+  where
+    entry Mosque { mosqueId = MosqueId mid, mosqueName = name } =
+      object
+        [ "id"   .= mid
+        , "name" .= name
+        ]
+
 notFoundJson :: Value
 notFoundJson = object ["error" .= ("not found" :: Text)]
+
+notSignedInJson :: Value
+notSignedInJson = object ["error" .= ("not signed in" :: Text)]
