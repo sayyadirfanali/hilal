@@ -13,10 +13,10 @@ import Data.Time (LocalTime, UTCTime, addUTCTime, getCurrentTime, localDay)
 import Data.Time.Zones (utcToLocalTimeTZ)
 import Database.SQLite.Simple (withTransaction)
 import Lucid (Html, renderText)
-import Network.HTTP.Types.Status (status304, status400, status403, status404)
+import Network.HTTP.Types.Status (status304, status400, status401, status403, status404)
 import Network.Wai (Application)
 import Numeric (showHex)
-import Web.Scotty hiding (next) 
+import Web.Scotty hiding (next)
 
 import Hilal.Assets (fnv1a)
 import Hilal.Auth
@@ -47,7 +47,7 @@ import Hilal.Edit
   , logLine
   , validateForm
   )
-import Hilal.JSON (notFoundJson, timingsJson)
+import Hilal.JSON (followedJson, notFoundJson, notSignedInJson, timingsJson)
 import Hilal.Query
   ( createMosque
   , deleteSignInCode
@@ -203,12 +203,23 @@ app cfg = scottyApp $ do
               liftIO $ mapM_ (configLogEdit cfg . logLine now (userId user) mid) (editLog m oldTimings valid)
               redirect (TL.fromStrict (mosqueUrl mid))
 
-  get "/api/mosques/:id/timings" $ do
+  get "/api/v1/mosques/:id/timings" $ do
     found <- loadMosque dbPath =<< pathParam "id"
     case found of
       Just (m, timings, _) | hasAllTimings timings ->
         timingsResponse (timingsJson m timings)
       _ -> apiNotFound
+
+  get "/api/v1/me/mosques" $ do
+    user <- currentUser dbPath
+    case user of
+      Nothing -> do
+        status status401
+        json notSignedInJson
+      Just u -> do
+        mosques <- liftIO $ withDb dbPath $ \conn -> followedMosques conn (userId u)
+        setHeader "Cache-Control" "private, no-cache"
+        json (followedJson mosques)
 
   get "/sign-in" $ do
     next <- safeNext . fromMaybe "" <$> queryParamMaybe "next"
@@ -257,10 +268,14 @@ app cfg = scottyApp $ do
           return (Left "That code has expired. Please request a new one.")
         Just CodeOk -> do
           deleteSignInCode conn email
-          user <- findOrCreateUser conn now email
-          token <- newToken
-          makeSession conn now (addUTCTime sessionLifetime now) (userId user) (sha256 token)
-          return (Right token)
+          blocked <- isBlocked conn email
+          if blocked
+            then return (Left "This email address can't be used to sign in.")
+            else do
+              user <- findOrCreateUser conn now email
+              token <- newToken
+              makeSession conn now (addUTCTime sessionLifetime now) (userId user) (sha256 token)
+              return (Right token)
         Just CodeWrong -> do
           incrementCodeAttempts conn email
           return (Left "That code isn't right. Please check it and try again.")

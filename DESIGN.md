@@ -18,6 +18,7 @@ Mosque admins may be added later, only if the community model stops working at s
 The superadmin, the project owner, moderates by deleting duplicates, reverting vandalism, and blocking users, all via SQL for now.
 The superadmin is identified by a hardcoded email address in `app/Main.hs`.
 A blocked user cannot sign in, their existing sessions stop working immediately, and the same email cannot sign up again, because the user row is kept.
+A code sent before the user was blocked is refused too.
 No page ever shows who added or edited a mosque, because that would reveal people's religious affiliation.
 
 ## Sign-in
@@ -79,7 +80,7 @@ If the WebView approach becomes difficult, the fallback is to make the home scre
 
 HTML is built with plain links and forms first, so every page works without JavaScript.
 JavaScript is added only where it clearly helps, such as preselecting the time zone; HTMX search-as-you-type is shelved for later.
-JSON is used only for the native side: one endpoint for a mosque's timings, which the app polls.
+JSON is used only for the native side: one endpoint listing the signed-in user's followed mosques, and one for a mosque's timings, which the app polls.
 
 ## Notifications and sync
 A PWA cannot fire a notification at an exact local time, so alarms are scheduled natively.
@@ -90,10 +91,20 @@ Alarms are rescheduled after reboot, time changes, and time-zone changes.
 Timings are synced by polling; there is no push service (no FCM).
 The app syncs when opened, after every alarm, shortly before Fajr, and once a day as a fallback.
 The pre-Fajr sync exists because there are no alarms between Isha and Fajr, and someone may change Fajr late at night.
-The endpoint is `GET /api/mosques/:id/timings`, returning the mosque's time zone and all six timings as 24-hour "HH:MM" text, keyed by stored prayer names.
+A sync first fetches the followed mosques, then each one's timings.
+
+`GET /api/v1/me/mosques` lists the signed-in user's followed mosques by name, with each mosque's id and name; the names are for notification text.
+It returns 401 when signed out, and is sent with `Cache-Control: private, no-cache`, because it belongs to one user.
+The native side is meant to call it with the WebView's session cookie, so it needs no sign-in of its own; this is still to be confirmed on a device.
+
+`GET /api/v1/mosques/:id/timings` returns the mosque's time zone and all six timings as 24-hour "HH:MM" text, keyed by stored prayer names.
 A mosque without all six timings returns 404, because it is not followable.
 The ETag is an FNV-1a hash of the response body, and the response is sent with `Cache-Control: no-cache`, so the app always revalidates and an unchanged mosque costs a tiny 304.
 Custom Azan sound is not supported for now; it would come with native notification channels later.
+
+All JSON routes live under `/api/v1`, because installed apps update slowly and can't all be changed at once.
+Adding a field is not a breaking change, so the app must ignore fields it doesn't know.
+A change that would break installed apps goes under `/api/v2`, and `/api/v1` keeps working until those apps have updated.
 
 ## Backend
 The backend is Haskell with Scotty, SQLite through `sqlite-simple`, `lucid2` for HTML, and the `time` library.
@@ -149,7 +160,7 @@ Test data is fictional or uses well-known public mosques, never personal details
 ## Not decided or not built yet
 - Sending email; codes are printed to the terminal until just before demos.
 - Coordinates: a location picker, pasting a Google Maps link, "near me", and perhaps a map.
-- The Android shell, and a JSON endpoint listing a user's followed mosques for it.
+- The Android shell.
 - A verification mark: green when a mosque is followed and nobody has reported its timings as wrong, a warning when someone has.
 - Search-as-you-type with HTMX, using `hx-select` on the existing page.
 - A styling pass and a custom theme.
@@ -157,6 +168,5 @@ Test data is fictional or uses well-known public mosques, never personal details
 - A Hijri date, which depends on local moon sighting and needs care.
 - Mosque admins, if community editing stops working at scale.
 - Account deletion, a privacy page, and privacy obligations, since followed mosques reveal religious affiliation.
-- Versioning the JSON API before the first app release.
 - Rotating and backing up `edits.log`.
 - Distribution without Google Play Services, e.g. F-Droid.

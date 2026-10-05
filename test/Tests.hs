@@ -15,7 +15,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.Lazy qualified as TL
-import Data.Time (Day, LocalTime (..), TimeOfDay (..), UTCTime (..), addUTCTime, fromGregorian)
+import Data.Time (Day, LocalTime (..), TimeOfDay (..), UTCTime (..), addUTCTime, fromGregorian, getCurrentTime)
 import Data.Time.Zones (utcToLocalTimeTZ)
 import Database.SQLite.Simple (Connection, Only (..), execute, execute_, query_)
 import Lucid (renderText)
@@ -29,7 +29,7 @@ import Hilal.App (Config (..), app)
 import Hilal.Auth (CodeCheck (..), canResend, checkCode, newCode, normaliseEmail, safeNext, sameOrigin, sessionToken, sha256)
 import Hilal.DB (withDb)
 import Hilal.Edit (MosqueForm (..), ValidMosque (..), changedTimings, editLog, emptyForm, validateForm)
-import Hilal.JSON (timingsJson)
+import Hilal.JSON (followedJson, timingsJson)
 import Hilal.Migrate (migrate)
 import Hilal.Query
   ( createMosque
@@ -73,6 +73,9 @@ seed conn = do
     \  (2, 'Sultan Ahmed Mosque', 'Sultanahmet, Istanbul', 41.0054,  28.9768, 'Europe/Istanbul'), \
     \  (3, 'Istiqlal Mosque',     'Gambir, Jakarta',       -6.1702, 106.8314, 'Asia/Jakarta'), \
     \  (4, 'Badshahi Mosque',     'Walled City, Lahore',   31.5879,  74.3099, 'Asia/Karachi')"
+  execute_ conn
+    "INSERT INTO users (email, blocked, created_at) VALUES \
+    \  ('blocked@example.com', 1, '2026-09-30T12:00:00Z')"
   forM_ allSix $ \(p, t) -> do
     saveTiming conn noon (MosqueId 2) p t
     saveTiming conn noon (MosqueId 3) p t
@@ -100,7 +103,8 @@ testApp = do
   app (testConfig path)
 
 data TestState = TestState
-  { stateCodes :: IORef [(Text, Text)]
+  { stateDb    :: FilePath
+  , stateCodes :: IORef [(Text, Text)]
   , stateLog   :: IORef [Text]
   }
 
@@ -114,7 +118,7 @@ authApp = do
     { configSendCode = \email code -> modifyIORef codes ((email, code) :)
     , configLogEdit  = \line -> modifyIORef logs (line :)
     }
-  return (TestState codes logs, application)
+  return (TestState path codes logs, application)
 
 postForm :: ByteString -> [Header] -> BL.ByteString -> WaiSession st SResponse
 postForm path headers =
@@ -399,6 +403,21 @@ main = hspec $ do
       timingsJson jamaMasjid [(Fajr, timesAt 5)]
         `shouldNotBe` timingsJson jamaMasjid [(Fajr, timesAt 6)]
 
+  describe "followedJson" $ do
+    it "lists each mosque's id and name" $
+      followedJson [jamaMasjid] `shouldBe`
+        object
+          [ "mosques" .=
+              [ object
+                  [ "id"   .= (1 :: Int)
+                  , "name" .= ("Jama Masjid" :: Text)
+                  ]
+              ]
+          ]
+
+    it "is an empty list when nothing is followed" $
+      followedJson [] `shouldBe` object ["mosques" .= ([] :: [Int])]
+
   describe "views" $ do
     it "shows the mosque's name" $
       renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing) `shouldSatisfy` TL.isInfixOf "Jama Masjid"
@@ -617,11 +636,9 @@ main = hspec $ do
         _ <- findOrCreateUser conn noon "reader@example.com"
         isBlocked conn "reader@example.com" `shouldReturn` False
 
-    it "can be blocked" $
-      withTestDb $ \conn -> do
-        _ <- findOrCreateUser conn noon "reader@example.com"
-        execute_ conn "UPDATE users SET blocked = 1 WHERE email = 'reader@example.com'"
-        isBlocked conn "reader@example.com" `shouldReturn` True
+    it "are blocked when the superadmin has marked them" $
+      withTestDb $ \conn ->
+        isBlocked conn "blocked@example.com" `shouldReturn` True
 
     it "who don't exist aren't blocked" $
       withTestDb $ \conn ->
@@ -647,11 +664,10 @@ main = hspec $ do
         killSession conn "token-hash"
         getSessionUser conn noon "token-hash" `shouldReturn` Nothing
 
-    it "stop working once the user is blocked" $
+    it "don't work for a blocked user" $
       withTestDb $ \conn -> do
-        user <- findOrCreateUser conn noon "reader@example.com"
+        user <- findOrCreateUser conn noon "blocked@example.com"
         makeSession conn noon later (userId user) "token-hash"
-        execute_ conn "UPDATE users SET blocked = 1 WHERE email = 'reader@example.com'"
         getSessionUser conn noon "token-hash" `shouldReturn` Nothing
 
   describe "follows" $ do
@@ -720,31 +736,35 @@ main = hspec $ do
       it "is 404 for an id that isn't a number" $
         get "/mosques/abc" `shouldRespondWith` 404
 
-    describe "GET /api/mosques/:id/timings" $ do
+    describe "GET /api/v1/mosques/:id/timings" $ do
       it "returns JSON for a mosque with all six timings" $
-        get "/api/mosques/2/timings" `shouldRespondWith` 200
+        get "/api/v1/mosques/2/timings" `shouldRespondWith` 200
           { matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"] }
 
       it "is 304 when the client already has the current version" $ do
-        response <- get "/api/mosques/2/timings"
+        response <- get "/api/v1/mosques/2/timings"
         case lookup "ETag" (simpleHeaders response) of
           Nothing -> liftIO (expectationFailure "response had no ETag")
           Just etag ->
-            request "GET" "/api/mosques/2/timings" [("If-None-Match", etag)] ""
+            request "GET" "/api/v1/mosques/2/timings" [("If-None-Match", etag)] ""
               `shouldRespondWith` 304
 
       it "is 200 when the client's version is stale" $
-        request "GET" "/api/mosques/2/timings" [("If-None-Match", "\"stale\"")] ""
+        request "GET" "/api/v1/mosques/2/timings" [("If-None-Match", "\"stale\"")] ""
           `shouldRespondWith` 200
 
       it "is 404 for a mosque without all six timings" $
-        get "/api/mosques/4/timings" `shouldRespondWith` 404
+        get "/api/v1/mosques/4/timings" `shouldRespondWith` 404
 
       it "is 404 for a missing mosque" $
-        get "/api/mosques/99/timings" `shouldRespondWith` 404
+        get "/api/v1/mosques/99/timings" `shouldRespondWith` 404
 
       it "is 404 for an id that isn't a number" $
-        get "/api/mosques/abc/timings" `shouldRespondWith` 404
+        get "/api/v1/mosques/abc/timings" `shouldRespondWith` 404
+
+    describe "GET /api/v1/me/mosques" $
+      it "is 401 when signed out" $
+        get "/api/v1/me/mosques" `shouldRespondWith` 401
 
     describe "the stylesheet" $ do
       it "is served at its fingerprinted URL, cached for a year" $
@@ -770,6 +790,20 @@ main = hspec $ do
 
       it "rejects an invalid email" $
         postForm "/sign-in" [] "email=not-an-email" `shouldRespondWith` 400
+
+      it "refuses a blocked email, without sending a code" $ do
+        postForm "/sign-in" [] "email=blocked%40example.com" `shouldRespondWith` 403
+        codes <- readCodes
+        liftIO (codes `shouldBe` [])
+
+      it "refuses a code issued before the user was blocked" $ do
+        db <- stateDb <$> getState
+        liftIO $ do
+          now <- getCurrentTime
+          withDb db $ \conn ->
+            saveSignInCode conn now (addUTCTime 600 now) "blocked@example.com" (sha256 "123456")
+        response <- postForm "/sign-in/code" [] "email=blocked%40example.com&code=123456"
+        liftIO (lookup "Set-Cookie" (simpleHeaders response) `shouldBe` Nothing)
 
       it "doesn't send a second code within a minute" $ do
         postForm "/sign-in" [] "email=reader%40example.com" `shouldRespondWith` 200
@@ -887,3 +921,18 @@ main = hspec $ do
         postForm "/mosques/4/follow" [("Cookie", cookie)] "" `shouldRespondWith` 302
         home <- homeBody cookie
         liftIO (home `shouldSatisfy` (not . BS.isInfixOf "Badshahi Mosque"))
+
+    describe "the followed-mosques API" $
+      it "lists the mosques you follow, for the signed-in user" $ do
+        cookie <- signIn
+        postForm "/mosques/2/follow" [("Cookie", cookie)] "" `shouldRespondWith` 302
+        response <- request "GET" "/api/v1/me/mosques" [("Cookie", cookie)] ""
+        liftIO $ decode (simpleBody response) `shouldBe` Just
+          (object
+            [ "mosques" .=
+                [ object
+                    [ "id"   .= (2 :: Int)
+                    , "name" .= ("Sultan Ahmed Mosque" :: Text)
+                    ]
+                ]
+            ])
