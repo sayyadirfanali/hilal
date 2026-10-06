@@ -26,13 +26,17 @@ import Test.Hspec
 import Test.Hspec.Wai
 
 import Hilal.App (Config (..), app)
+import Hilal.Assets (interFontPath, maplibreJsPath)
 import Hilal.Auth (CodeCheck (..), canResend, checkCode, newCode, normaliseEmail, safeNext, sameOrigin, sessionToken, sha256)
 import Hilal.DB (withDb)
-import Hilal.Edit (MosqueForm (..), ValidMosque (..), changedTimings, editLog, emptyForm, validateForm)
+import Hilal.Edit (MosqueForm (..), ValidMosque (..), changedTimings, editLog, emptyForm, validateForm, validateNew)
+import Hilal.Hijri (HijriDate (..), HijriPart (..), hijriFromDay, hijriParts)
 import Hilal.JSON (followedJson, timingsJson)
+import Hilal.Location (distanceMeters, locate, parseLocation, shortLink)
 import Hilal.Migrate (migrate)
 import Hilal.Query
   ( createMosque
+  , deleteExpired
   , deleteSignInCode
   , findOrCreateUser
   , followMosque
@@ -53,9 +57,9 @@ import Hilal.Query
   , unfollowMosque
   , updateMosque
   )
-import Hilal.Time (lookupZone, nextPrayer, upcomingToday)
+import Hilal.Time (NextJamaat (..), lookupZone, nextJamaat, nextPrayer, upcomingToday)
 import Hilal.Types
-import Hilal.Views (FollowState (..), clockDigits, clockPeriod, homePage, mosqueFormPage, mosquePage, mosquesPage, stylesheetPath)
+import Hilal.Views (FollowState (..), clockDigits, clockPeriod, countdown, formatDistance, homePage, mosqueFormPage, mosquePage, mosquesPage, stylesheetPath)
 
 thursday, friday :: Day
 thursday = fromGregorian 2026 10 1
@@ -94,6 +98,8 @@ testConfig path = Config
   , configSuperadmin    = "admin@example.com"
   , configSendCode      = \_ _ -> return ()
   , configLogEdit       = \_ -> return ()
+  , configDemoCode      = Nothing
+  , configResolveLink   = \_ -> return Nothing
   }
 
 testApp :: IO Application
@@ -109,16 +115,31 @@ data TestState = TestState
   }
 
 authApp :: IO (TestState, Application)
-authApp = do
+authApp = authAppWith id
+
+authAppWith :: (Config -> Config) -> IO (TestState, Application)
+authAppWith change = do
   path <- emptySystemTempFile "hilal-test.db"
   withDb path seed
   codes <- newIORef []
   logs  <- newIORef []
-  application <- app (testConfig path)
+  application <- app $ change (testConfig path)
     { configSendCode = \email code -> modifyIORef codes ((email, code) :)
     , configLogEdit  = \line -> modifyIORef logs (line :)
     }
   return (TestState path codes logs, application)
+
+-- A short link that the test resolver below knows, and where it points.
+shortNoorLink :: Text
+shortNoorLink = "https://maps.app.goo.gl/noor"
+
+resolveTestLink :: Text -> IO (Maybe Text)
+resolveTestLink url
+  | url == shortNoorLink = return (Just "https://www.google.com/maps/place/Noor+Masjid/@21.2101,81.3502,17z")
+  | otherwise            = return Nothing
+
+bodyOf :: ByteString -> WaiSession st ByteString
+bodyOf path = BL.toStrict . simpleBody <$> get path
 
 postForm :: ByteString -> [Header] -> BL.ByteString -> WaiSession st SResponse
 postForm path headers =
@@ -150,7 +171,7 @@ homeBody cookie = do
 
 newMosqueBody :: BL.ByteString
 newMosqueBody =
-  "name=Noor+Masjid&address=Supela%2C+Bhilai&timezone=Asia%2FKolkata\
+  "name=Noor+Masjid&address=Supela%2C+Bhilai&timezone=Asia%2FKolkata&location=21.2101%2C81.3502\
   \&fajr_azan=05:00&fajr_jamaat=05:15&zuhr_azan=13:00&zuhr_jamaat=13:15\
   \&asr_azan=16:30&asr_jamaat=16:45&maghrib_azan=18:00&maghrib_jamaat=18:05\
   \&isha_azan=19:30&isha_jamaat=19:45&jumuah_azan=13:00&jumuah_jamaat=13:30"
@@ -167,14 +188,14 @@ jamaMasjid = Mosque {
   mosqueId = MosqueId 1
 , mosqueName = "Jama Masjid"
 , mosqueAddress = "Sector 6, Bhilai"
-, mosqueLat = Just 21.2036
-, mosqueLng = Just 81.3700
+, mosqueLat = 21.2036
+, mosqueLng = 81.3700
 , mosqueTimezone = "Asia/Kolkata"
 }
 
 validForm :: MosqueForm
 validForm =
-  MosqueForm "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata"
+  MosqueForm "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" ""
     (map (\(p, t) -> (p, (formatClock (ptAzan t), formatClock (ptJamaat t)))) allSix)
 
 setTimes :: Prayer -> (Text, Text) -> MosqueForm -> MosqueForm
@@ -192,6 +213,14 @@ timesAt h = PrayerTime (TimeOfDay h 0 0) (TimeOfDay h 15 0)
 
 allSix :: [(Prayer, PrayerTime)]
 allSix = zip [minBound .. maxBound] (map timesAt [5, 13, 16, 18, 20, 13])
+
+-- 14:00 on Thursday in Kolkata, which is UTC+5:30.
+thursdayAfternoon :: UTCTime
+thursdayAfternoon = UTCTime thursday (8 * 60 * 60 + 30 * 60)
+
+-- What `nextJamaat` gives for Jama Masjid at that moment: Asr at 16:15, in 2 h 15 min.
+asrNext :: NextJamaat
+asrNext = NextJamaat Asr (TimeOfDay 16 15 0) False (UTCTime thursday (10 * 60 * 60 + 45 * 60)) 8100
 
 main :: IO ()
 main = hspec $ do
@@ -260,6 +289,37 @@ main = hspec $ do
     it "uses Jumu'ah instead of Zuhr on Fridays" $
       upcomingToday (at friday 12 0) allSix `shouldBe` [Jumuah, Asr, Maghrib, Isha]
 
+  describe "nextJamaat" $ do
+    let kolkata = lookupZone "Asia/Kolkata"
+
+    it "gives the next Jamaat as a local time and an exact moment" $
+      ((\zone -> nextJamaat zone thursdayAfternoon allSix) <$> kolkata)
+        `shouldBe` Just (Just asrNext)
+
+    it "is tomorrow's Fajr after Isha" $
+      ((\zone -> nextJamaat zone (addUTCTime (8 * 60 * 60) thursdayAfternoon) allSix) <$> kolkata)
+        `shouldBe` Just (Just (NextJamaat Fajr (TimeOfDay 5 15 0) True (UTCTime thursday (23 * 60 * 60 + 45 * 60)) 26100))
+
+    it "never counts down below zero during the Jamaat minute" $
+      (fmap njSeconds . (\zone -> nextJamaat zone (addUTCTime 8130 thursdayAfternoon) allSix) <$> kolkata)
+        `shouldBe` Just (Just 0)
+
+  describe "countdown" $ do
+    it "says now once the Jamaat minute has begun" $
+      countdown 0 `shouldBe` "now"
+
+    it "rounds up to the next minute" $
+      countdown 30 `shouldBe` "in 1 min"
+
+    it "shows minutes under an hour" $
+      countdown (42 * 60) `shouldBe` "in 42 min"
+
+    it "shows whole hours without minutes" $
+      countdown (60 * 60) `shouldBe` "in 1 h"
+
+    it "shows hours and minutes" $
+      countdown (65 * 60) `shouldBe` "in 1 h 5 min"
+
   describe "lookupZone" $ do
     it "finds a known zone" $
       isJust (lookupZone "Asia/Kolkata") `shouldBe` True
@@ -293,6 +353,102 @@ main = hspec $ do
 
     it "starts adding with every prayer blank" $
       validateForm emptyForm `shouldSatisfy` isLeft
+
+  describe "validateNew" $ do
+    it "accepts a complete form with a location" $
+      validateNew validForm (Just (Coords 21.2101 81.3502))
+        `shouldBe` Right (ValidMosque "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" allSix, Coords 21.2101 81.3502)
+
+    it "requires a location" $
+      validateNew validForm Nothing `shouldSatisfy` isLeft
+
+    it "reports the location and the form's own errors together" $
+      fmap length (either Just (const Nothing) (validateNew validForm { formName = "" } Nothing))
+        `shouldBe` Just 2
+
+  describe "parseLocation" $ do
+    it "prefers the place's pin to the map's centre" $
+      parseLocation "https://www.google.com/maps/place/Jama+Masjid/@21.2030,81.3690,17z/data=!3m1!4b1!4m6!3m5!8m2!3d21.2036!4d81.37!16s"
+        `shouldBe` Just (Coords 21.2036 81.37)
+
+    it "reads the map's centre" $
+      parseLocation "https://www.google.com/maps/@21.2036,81.37,15z"
+        `shouldBe` Just (Coords 21.2036 81.37)
+
+    it "reads coordinates in a query" $
+      parseLocation "https://maps.google.com/?q=21.2036,81.37"
+        `shouldBe` Just (Coords 21.2036 81.37)
+
+    it "reads plain coordinates" $
+      parseLocation " 21.2036, 81.37 " `shouldBe` Just (Coords 21.2036 81.37)
+
+    it "finds the link in the text Google Maps shares" $
+      parseLocation "Jama Masjid\nhttps://www.google.com/maps/@21.2036,81.37,15z"
+        `shouldBe` Just (Coords 21.2036 81.37)
+
+    it "reads a link wrapped in Google's consent page" $
+      parseLocation "https://consent.google.com/m?continue=https://www.google.com/maps/place/X/%4021.2036,81.37,17z"
+        `shouldBe` Just (Coords 21.2036 81.37)
+
+    it "finds nothing in a query by name" $
+      parseLocation "https://maps.google.com/?q=Jama+Masjid" `shouldBe` Nothing
+
+    it "rejects coordinates out of range" $
+      parseLocation "https://www.google.com/maps/@95.0,81.37,15z" `shouldBe` Nothing
+
+    it "finds nothing in a short link, which has to be followed first" $
+      parseLocation "https://maps.app.goo.gl/abc123" `shouldBe` Nothing
+
+  describe "shortLink" $ do
+    it "finds a short link in shared text, as https" $
+      shortLink "Jama Masjid http://maps.app.goo.gl/abc123" `shouldBe` Just "https://maps.app.goo.gl/abc123"
+
+    it "ignores links to other sites" $
+      shortLink "https://example.com/abc123" `shouldBe` Nothing
+
+  describe "locate" $ do
+    it "follows a short link" $
+      locate resolveTestLink shortNoorLink `shouldReturn` Just (Coords 21.2101 81.3502)
+
+    it "doesn't need the resolver for a full link" $
+      locate (\_ -> error "should not be called") "https://www.google.com/maps/@21.2036,81.37,15z"
+        `shouldReturn` Just (Coords 21.2036 81.37)
+
+    it "is nothing when the short link can't be followed" $
+      locate (\_ -> return Nothing) shortNoorLink `shouldReturn` Nothing
+
+  describe "distanceMeters" $
+    it "measures one degree of latitude as about 111 km" $
+      distanceMeters (Coords 21 81) (Coords 22 81) `shouldSatisfy` (\d -> abs (d - 111195) < 100)
+
+  describe "formatDistance" $ do
+    it "shows short distances in metres, to the nearest 10" $
+      formatDistance 347 `shouldBe` "350 m"
+
+    it "shows a decimal under 10 km" $
+      formatDistance 2449 `shouldBe` "2.4 km"
+
+    it "shows whole kilometres beyond that" $
+      formatDistance 24400 `shouldBe` "24 km"
+
+  describe "hijriFromDay" $ do
+    it "finds the Umm al-Qura date" $
+      hijriFromDay (fromGregorian 2026 10 1) `shouldBe` Just (HijriDate 1448 4 20)
+
+    it "starts a month on its first day" $
+      hijriFromDay (fromGregorian 2026 6 16) `shouldBe` Just (HijriDate 1448 1 1)
+
+    it "is nothing outside the table" $
+      hijriFromDay (fromGregorian 2020 1 1) `shouldBe` Nothing
+
+  describe "hijriParts" $ do
+    it "shows the day before and the Umm al-Qura day" $
+      hijriParts (fromGregorian 2026 10 1)
+        `shouldBe` Just [HijriText "19/20 ", HijriMonth 4, HijriText " 1448"]
+
+    it "names both months and years across a new year" $
+      hijriParts (fromGregorian 2026 6 16)
+        `shouldBe` Just [HijriText "29 ", HijriMonth 12, HijriText " 1447 / 1 ", HijriMonth 1, HijriText " 1448"]
 
   describe "changedTimings" $
     it "keeps only prayers whose times differ" $
@@ -420,10 +576,10 @@ main = hspec $ do
 
   describe "views" $ do
     it "shows the mosque's name" $
-      renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing) `shouldSatisfy` TL.isInfixOf "Jama Masjid"
+      renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing Nothing) `shouldSatisfy` TL.isInfixOf "Jama Masjid"
 
     it "escapes names, so admins can't inject HTML" $
-      renderText (mosquePage jamaMasjid { mosqueName = "<b>x</b>" } [] Nothing Nothing Nothing)
+      renderText (mosquePage jamaMasjid { mosqueName = "<b>x</b>" } [] Nothing Nothing Nothing Nothing)
         `shouldSatisfy` (not . TL.isInfixOf "<b>x</b>")
 
     it "shows morning times in 12-hour format" $
@@ -439,39 +595,65 @@ main = hspec $ do
         `shouldBe` ("12:30", "PM")
 
     it "lists mosques by name" $
-      renderText (mosquesPage "" [jamaMasjid] False)
+      renderText (mosquesPage "jama" Nothing [(jamaMasjid, Nothing)] False)
         `shouldSatisfy` TL.isInfixOf "Jama Masjid"
 
     it "escapes the search text" $
-      renderText (mosquesPage "<script>" [] False)
-        `shouldSatisfy` (not . TL.isInfixOf "<script>")
+      renderText (mosquesPage "<b>q</b>" Nothing [] False)
+        `shouldSatisfy` (not . TL.isInfixOf "<b>q</b>")
+
+    it "asks for a location or a search before listing anything" $
+      renderText (mosquesPage "" Nothing [] False)
+        `shouldSatisfy` TL.isInfixOf "Show mosques near me"
+
+    it "shows distances and a map near a location" $ do
+      let html = renderText (mosquesPage "" (Just (Coords 21.2 81.37)) [(jamaMasjid, Just 400)] False)
+      html `shouldSatisfy` TL.isInfixOf "400 m"
+      html `shouldSatisfy` TL.isInfixOf "id=\"map\""
+
+    it "shows the Hijri date under today's date, with the month in Urdu" $ do
+      let html = renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) Nothing Nothing Nothing)
+      html `shouldSatisfy` TL.isInfixOf "19/20 "
+      html `shouldSatisfy` TL.isInfixOf "ربیع الثانی"
+
+    it "names each prayer in Urdu" $
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing)
+        `shouldSatisfy` TL.isInfixOf "جمعہ"
 
     it "shows the next prayer" $
-      renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) Nothing Nothing)
+      renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) (Just asrNext) Nothing Nothing)
         `shouldSatisfy` TL.isInfixOf "Asr Jamaat"
 
+    it "shows how long until the next Jamaat" $
+      renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) (Just asrNext) Nothing Nothing)
+        `shouldSatisfy` TL.isInfixOf "in 2 h 15 min"
+
     it "shows no next prayer when the local time is unknown" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing)
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing)
         `shouldSatisfy` (not . TL.isInfixOf "Next")
+
+    it "has no script when there is nothing to count down" $
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing)
+        `shouldSatisfy` (not . TL.isInfixOf "<script")
 
     it "escapes values typed into the mosque form" $
       renderText (mosqueFormPage "Add a mosque" "/mosques/new" [] emptyForm { formName = "<b>x</b>" } [] False)
         `shouldSatisfy` (not . TL.isInfixOf "<b>x</b>")
 
     it "offers to follow a listed mosque" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing (Just NotFollowing))
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just NotFollowing))
         `shouldSatisfy` TL.isInfixOf "/mosques/1/follow"
 
     it "offers to unfollow a followed mosque" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing (Just Following))
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just Following))
         `shouldSatisfy` TL.isInfixOf "/mosques/1/unfollow"
 
     it "sends signed-out visitors to sign in before following" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing (Just SignedOut))
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just SignedOut))
         `shouldSatisfy` TL.isInfixOf "/sign-in?next=%2Fmosques%2F1"
 
     it "has no follow button for an unlisted mosque" $
-      renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing)
+      renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing Nothing)
         `shouldSatisfy` (not . TL.isInfixOf "/follow")
 
     it "invites browsing when nothing is followed" $
@@ -479,7 +661,7 @@ main = hspec $ do
         `shouldSatisfy` TL.isInfixOf "Browse mosques"
 
     it "shows each followed mosque's next prayer" $
-      renderText (homePage [(jamaMasjid, allSix, Just (at thursday 14 0))])
+      renderText (homePage [(jamaMasjid, Just asrNext)])
         `shouldSatisfy` TL.isInfixOf "Asr Jamaat"
 
   describe "migrate" $
@@ -508,11 +690,11 @@ main = hspec $ do
         getMosque conn (MosqueId 99) `shouldReturn` Nothing
 
   describe "createMosque" $
-    it "adds a mosque without coordinates" $
+    it "adds a mosque with its coordinates" $
       withTestDb $ \conn -> do
-        mid <- createMosque conn "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata"
+        mid <- createMosque conn "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" (Coords 21.2101 81.3502)
         getMosque conn mid
-          `shouldReturn` Just (Mosque mid "Noor Masjid" "Supela, Bhilai" Nothing Nothing "Asia/Kolkata")
+          `shouldReturn` Just (Mosque mid "Noor Masjid" "Supela, Bhilai" 21.2101 81.3502 "Asia/Kolkata")
 
   describe "updateMosque" $
     it "changes the details but keeps the coordinates" $
@@ -566,33 +748,37 @@ main = hspec $ do
     let names = map mosqueName
     it "lists only mosques with all six timings, by name" $
       withTestDb $ \conn ->
-        names <$> searchMosques conn 50 ""
+        names <$> searchMosques conn (Just 50) ""
           `shouldReturn` ["Istiqlal Mosque", "Sultan Ahmed Mosque"]
 
     it "ignores case" $
       withTestDb $ \conn ->
-        names <$> searchMosques conn 50 "ISTANBUL" `shouldReturn` ["Sultan Ahmed Mosque"]
+        names <$> searchMosques conn (Just 50) "ISTANBUL" `shouldReturn` ["Sultan Ahmed Mosque"]
 
     it "matches by name" $
       withTestDb $ \conn ->
-        names <$> searchMosques conn 50 "sultan" `shouldReturn` ["Sultan Ahmed Mosque"]
+        names <$> searchMosques conn (Just 50) "sultan" `shouldReturn` ["Sultan Ahmed Mosque"]
 
     it "matches by address" $
       withTestDb $ \conn ->
-        names <$> searchMosques conn 50 "gamb" `shouldReturn` ["Istiqlal Mosque"]
+        names <$> searchMosques conn (Just 50) "gamb" `shouldReturn` ["Istiqlal Mosque"]
 
     it "treats % and _ literally" $
       withTestDb $ \conn -> do
-        searchMosques conn 50 "%" `shouldReturn` []
-        searchMosques conn 50 "_" `shouldReturn` []
+        searchMosques conn (Just 50) "%" `shouldReturn` []
+        searchMosques conn (Just 50) "_" `shouldReturn` []
 
     it "respects the limit" $
       withTestDb $ \conn ->
-        length <$> searchMosques conn 1 "" `shouldReturn` 1
+        length <$> searchMosques conn (Just 1) "" `shouldReturn` 1
+
+    it "returns every match without a limit" $
+      withTestDb $ \conn ->
+        length <$> searchMosques conn Nothing "" `shouldReturn` 2
 
     it "agrees with hasAllTimings on which mosques are listed" $
       withTestDb $ \conn -> do
-        listed <- map mosqueId <$> searchMosques conn 50 ""
+        listed <- map mosqueId <$> searchMosques conn (Just 50) ""
         complete <- filterM (fmap hasAllTimings . getTimings conn) (map MosqueId [1 .. 4])
         sort listed `shouldBe` complete
 
@@ -623,6 +809,20 @@ main = hspec $ do
         saveSignInCode conn noon later "reader@example.com" "hash"
         deleteSignInCode conn "reader@example.com"
         getSignInCode conn "reader@example.com" `shouldReturn` Nothing
+
+  describe "deleteExpired" $
+    it "removes expired codes and sessions, and keeps current ones" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        saveSignInCode conn noon later "old@example.com" "hash"
+        saveSignInCode conn later (addUTCTime 600 later) "new@example.com" "hash"
+        makeSession conn noon later (userId user) "old-token"
+        makeSession conn noon (addUTCTime 600 later) (userId user) "new-token"
+        deleteExpired conn later
+        getSignInCode conn "old@example.com" `shouldReturn` Nothing
+        isJust <$> getSignInCode conn "new@example.com" `shouldReturn` True
+        tokens <- query_ conn "SELECT token_hash FROM sessions"
+        map fromOnly tokens `shouldBe` ["new-token" :: Text]
 
   describe "users" $ do
     it "are created once per email" $
@@ -726,6 +926,21 @@ main = hspec $ do
       it "accepts an empty search" $
         get "/mosques?q=" `shouldRespondWith` 200
 
+      it "lists nothing until there is a location or a search" $ do
+        body <- bodyOf "/mosques"
+        liftIO (body `shouldSatisfy` (not . BS.isInfixOf "Sultan Ahmed Mosque"))
+
+      it "lists the nearest mosques first, with distances" $ do
+        body <- bodyOf "/mosques?lat=41.006&lng=28.977"
+        liftIO $ do
+          body `shouldSatisfy` BS.isInfixOf "Sultan Ahmed Mosque"
+          fst (BS.breakSubstring "Sultan Ahmed Mosque" body)
+            `shouldSatisfy` (not . BS.isInfixOf "Istiqlal Mosque")
+
+      it "ignores a location that isn't a number" $ do
+        body <- bodyOf "/mosques?lat=north&lng=28.977"
+        liftIO (body `shouldSatisfy` (not . BS.isInfixOf "Sultan Ahmed Mosque"))
+
     describe "GET /mosques/:id" $ do
       it "shows an existing mosque" $
         get "/mosques/1" `shouldRespondWith` 200
@@ -773,6 +988,16 @@ main = hspec $ do
 
       it "is served for any fingerprint, so pages open before a deploy keep working" $
         get "/static/old-hash/app.css" `shouldRespondWith` 200
+
+    describe "the fonts" $
+      it "are served from Hilal itself, cached for a year" $
+        get (encodeUtf8 interFontPath) `shouldRespondWith` 200
+          { matchHeaders = ["Content-Type" <:> "font/woff2"] }
+
+    describe "the map library" $
+      it "is served from Hilal itself, cached for a year" $
+        get (encodeUtf8 maplibreJsPath) `shouldRespondWith` 200
+          { matchHeaders = ["Cache-Control" <:> "public, max-age=31536000, immutable"] }
 
     describe "unknown URLs" $
       it "are 404" $
@@ -872,6 +1097,13 @@ main = hspec $ do
         logLines <- readLog
         liftIO (logLines `shouldSatisfy` any (T.isInfixOf "created"))
 
+      it "refuses a mosque without a location" $ do
+        cookie <- signIn
+        let (before, rest) = BS.breakSubstring "&location=" (BL.toStrict newMosqueBody)
+            timings = snd (BS.breakSubstring "&fajr_azan" rest)
+        postForm "/mosques/new" [("Cookie", cookie)] (BL.fromStrict (before <> timings))
+          `shouldRespondWith` 400
+
       it "refuses a mosque without all six timings" $ do
         cookie <- signIn
         postForm "/mosques/new" [("Cookie", cookie)] "name=Noor+Masjid&address=Supela&timezone=Asia%2FKolkata"
@@ -936,3 +1168,22 @@ main = hspec $ do
                     ]
                 ]
             ])
+
+  withState (authAppWith (\c -> c { configDemoCode = Just "424242" })) $
+    describe "demo mode" $
+      it "uses the demo code for every sign-in" $ do
+        postForm "/sign-in" [] "email=reader%40example.com" `shouldRespondWith` 200
+        codes <- readCodes
+        liftIO (codes `shouldBe` [("reader@example.com", "424242")])
+        postForm "/sign-in/code" [] "email=reader%40example.com&code=424242"
+          `shouldRespondWith` 302
+
+  withState (authAppWith (\c -> c { configResolveLink = resolveTestLink })) $
+    describe "adding a mosque from a short link" $
+      it "follows the link to find the location" $ do
+        cookie <- signIn
+        let body = BL.fromStrict (fst (BS.breakSubstring "&location=" (BL.toStrict newMosqueBody)))
+              <> "&location=" <> BL.fromStrict (encodeUtf8 shortNoorLink)
+              <> BL.fromStrict (snd (BS.breakSubstring "&fajr_azan" (BL.toStrict newMosqueBody)))
+        postForm "/mosques/new" [("Cookie", cookie)] body
+          `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/5"] }

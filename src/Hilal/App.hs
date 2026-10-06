@@ -3,6 +3,7 @@ module Hilal.App (Config (..), app) where
 import Control.Monad (forM, forM_, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as BL
+import Data.List (sortOn)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -18,7 +19,7 @@ import Network.Wai (Application)
 import Numeric (showHex)
 import Web.Scotty hiding (next)
 
-import Hilal.Assets (fnv1a)
+import Hilal.Assets (fnv1a, interFont, maplibreCss, maplibreJs, urduFont)
 import Hilal.Auth
   ( CodeCheck (..)
   , canResend
@@ -46,10 +47,13 @@ import Hilal.Edit
   , formFromMosque
   , logLine
   , validateForm
+  , validateNew
   )
 import Hilal.JSON (followedJson, notFoundJson, notSignedInJson, timingsJson)
+import Hilal.Location (coordsFromParams, distanceMeters, locate)
 import Hilal.Query
   ( createMosque
+  , deleteExpired
   , deleteSignInCode
   , findOrCreateUser
   , followMosque
@@ -70,8 +74,8 @@ import Hilal.Query
   , unfollowMosque
   , updateMosque
   )
-import Hilal.Time (lookupZone, upcomingToday)
-import Hilal.Types (Mosque (..), MosqueId (..), Prayer, PrayerTime, User (..), hasAllTimings, prayerToText)
+import Hilal.Time (lookupZone, nextJamaat, upcomingToday)
+import Hilal.Types (Mosque (..), MosqueId (..), Prayer, PrayerTime, User (..), hasAllTimings, mosqueCoords, prayerToText)
 import Hilal.Views
   ( FollowState (..)
   , accountPage
@@ -93,6 +97,8 @@ data Config = Config
   , configSuperadmin    :: Text
   , configSendCode      :: Text -> Text -> IO ()
   , configLogEdit       :: Text -> IO ()
+  , configDemoCode      :: Maybe Text                -- every sign-in code, for demos; never in production
+  , configResolveLink   :: Text -> IO (Maybe Text)   -- where a Google Maps short link points
   }
 
 data SendOutcome = CodeSent | CodeTooSoon | EmailBlocked
@@ -104,10 +110,20 @@ app cfg = scottyApp $ do
   get "/health" $
     text "ok"
 
-  get "/static/:hash/app.css" $ do
-    setHeader "Content-Type" "text/css; charset=utf-8"
-    setHeader "Cache-Control" "public, max-age=31536000, immutable"
-    raw (BL.fromStrict stylesheet)
+  get "/static/:hash/app.css" $
+    asset "text/css; charset=utf-8" stylesheet
+
+  get "/static/:hash/maplibre-gl.js" $
+    asset "text/javascript; charset=utf-8" maplibreJs
+
+  get "/static/:hash/maplibre-gl.css" $
+    asset "text/css; charset=utf-8" maplibreCss
+
+  get "/static/:hash/inter.woff2" $
+    asset "font/woff2" interFont
+
+  get "/static/:hash/urdu.woff2" $
+    asset "font/woff2" urduFont
 
   get "/" $ do
     user <- currentUser dbPath
@@ -119,15 +135,26 @@ app cfg = scottyApp $ do
           mosques <- followedMosques conn (userId u)
           forM mosques $ \m -> do
             timings <- getTimings conn (mosqueId m)
-            let localNow = (`utcToLocalTimeTZ` now) <$> lookupZone (mosqueTimezone m)
-            return (m, timings, localNow)
+            let coming = lookupZone (mosqueTimezone m) >>= \zone -> nextJamaat zone now timings
+            return (m, coming)
         page (homePage entries)
 
   get "/mosques" $ do
     q <- maybe "" T.strip <$> queryParamMaybe "q"
-    found <- liftIO $ withDb dbPath $ \conn ->
-      searchMosques conn (pageSize + 1) q
-    page (mosquesPage q (take pageSize found) (length found > pageSize))
+    lat <- queryParamMaybe "lat"
+    lng <- queryParamMaybe "lng"
+    case coordsFromParams <$> lat <*> lng of
+      Just (Just here) -> do
+        found <- liftIO $ withDb dbPath $ \conn ->
+          searchMosques conn Nothing q
+        let nearest = take nearCount (sortOn snd (map (\m -> (m, distanceMeters here (mosqueCoords m))) found))
+        page (mosquesPage q (Just here) (map (fmap Just) nearest) False)
+      _ | T.null q ->
+            page (mosquesPage q Nothing [] False)
+        | otherwise -> do
+            found <- liftIO $ withDb dbPath $ \conn ->
+              searchMosques conn (Just (pageSize + 1)) q
+            page (mosquesPage q Nothing (map (\m -> (m, Nothing)) (take pageSize found)) (length found > pageSize))
 
   get "/mosques/new" $
     requireUser dbPath "/mosques/new" $ \_ ->
@@ -136,17 +163,18 @@ app cfg = scottyApp $ do
   post "/mosques/new" $ sameOriginOnly $
     requireUser dbPath "/mosques/new" $ \user -> do
       form <- readMosqueForm
-      case validateForm form of
+      location <- liftIO (locate (configResolveLink cfg) (formLocation form))
+      case validateNew form location of
         Left errors -> do
           status status400
-          page (mosqueFormPage "Add a mosque" "/mosques/new" errors form [] False)
-        Right valid -> do
+          page (mosqueFormPage "Add a mosque" "/mosques/new" errors form [] True)
+        Right (valid, coords) -> do
           now <- liftIO getCurrentTime
           mid <- liftIO $ withDb dbPath $ \conn -> withTransaction conn $ do
-            newId <- createMosque conn (validName valid) (validAddress valid) (validTimezone valid)
+            newId <- createMosque conn (validName valid) (validAddress valid) (validTimezone valid) coords
             forM_ (validTimings valid) $ uncurry (saveTiming conn now newId)
             return newId
-          liftIO $ mapM_ (configLogEdit cfg . logLine now (userId user) mid) (creationLog valid)
+          liftIO $ mapM_ (configLogEdit cfg . logLine now (userId user) mid) (creationLog valid coords)
           redirect (TL.fromStrict (mosqueUrl mid))
 
   get "/mosques/:id" $ do
@@ -163,9 +191,10 @@ app cfg = scottyApp $ do
             return (if yes then Following else NotFollowing)
         let zone        = lookupZone (mosqueTimezone m)
             localNow    = (`utcToLocalTimeTZ` now) <$> zone
+            coming      = zone >>= \z -> nextJamaat z now timings
             updatedDay  = localDay <$> (utcToLocalTimeTZ <$> zone <*> updated)
             followState = if hasAllTimings timings then Just following else Nothing
-        page (mosquePage m timings localNow updatedDay followState)
+        page (mosquePage m timings localNow coming updatedDay followState)
 
   post "/mosques/:id/follow" $ sameOriginOnly $
     changeFollow dbPath Follow =<< pathParam "id"
@@ -235,6 +264,7 @@ app cfg = scottyApp $ do
       Just email -> do
         now <- liftIO getCurrentTime
         outcome <- liftIO $ withDb dbPath $ \conn -> do
+          deleteExpired conn now
           blocked <- isBlocked conn email
           existing <- getSignInCode conn email
           if blocked
@@ -242,7 +272,7 @@ app cfg = scottyApp $ do
             else
               if maybe True (canResend now) existing
                 then do
-                  code <- newCode
+                  code <- maybe newCode return (configDemoCode cfg)
                   saveSignInCode conn now (addUTCTime codeLifetime now) email (sha256 code)
                   configSendCode cfg email code
                   return CodeSent
@@ -361,11 +391,12 @@ readMosqueForm = do
   name     <- textParam "name"
   address  <- textParam "address"
   timezone <- textParam "timezone"
+  location <- textParam "location"
   times <- forM [minBound .. maxBound] $ \p -> do
     azan   <- textParam (prayerToText p <> "_azan")
     jamaat <- textParam (prayerToText p <> "_jamaat")
     return (p, (azan, jamaat))
-  return (MosqueForm name address timezone times)
+  return (MosqueForm name address timezone location times)
 
 textParam :: Text -> ActionM Text
 textParam key = fromMaybe "" <$> formParamMaybe (TL.fromStrict key)
@@ -440,5 +471,14 @@ apiNotFound = do
   status status404
   json notFoundJson
 
+asset :: TL.Text -> ByteString -> ActionM ()
+asset contentType contents = do
+  setHeader "Content-Type" contentType
+  setHeader "Cache-Control" "public, max-age=31536000, immutable"
+  raw (BL.fromStrict contents)
+
 pageSize :: Int
 pageSize = 50
+
+nearCount :: Int
+nearCount = 20

@@ -2,8 +2,8 @@ CREATE TABLE IF NOT EXISTS mosques (
   id        INTEGER PRIMARY KEY,
   name      TEXT NOT NULL,
   address   TEXT NOT NULL,
-  lat       REAL,          -- optional until a location picker exists
-  lng       REAL,
+  lat       REAL NOT NULL, -- degrees north
+  lng       REAL NOT NULL, -- degrees east
   timezone  TEXT NOT NULL  -- 'Asia/Kolkata'
 );
 

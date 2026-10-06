@@ -48,14 +48,11 @@ CROSS JOIN (VALUES
   ('Old City',      'Indore',    22.72, 75.86)
 ) AS c;
 
+-- Spread each city's mosques out a little, so their pins don't overlap.
 UPDATE mosques
 SET lat = round(lat + (id * 37 % 200 - 100) / 10000.0, 4),
     lng = round(lng + (id * 53 % 200 - 100) / 10000.0, 4)
 WHERE id > 3;
-
-UPDATE mosques
-SET lat = NULL, lng = NULL
-WHERE id > 3 AND id % 11 = 0;
 
 INSERT INTO timings (mosque_id, prayer, azan_time, jamaat_time, updated_at)
 SELECT
