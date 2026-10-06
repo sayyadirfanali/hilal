@@ -10,6 +10,7 @@ module Hilal.Query
   , getSignInCode
   , incrementCodeAttempts
   , deleteSignInCode
+  , deleteExpired
   , findOrCreateUser
   , isBlocked
   , makeSession
@@ -21,12 +22,14 @@ module Hilal.Query
   , followedMosques
   ) where
 
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Time (UTCTime)
 import Database.SQLite.Simple (Connection, Only (..), execute, lastInsertRowId, query, (:.) (..))
 
 import Hilal.Types
-  ( Mosque
+  ( Coords (..)
+  , Mosque
   , MosqueId (..)
   , Prayer
   , PrayerTime (ptAzan, ptJamaat)
@@ -65,7 +68,8 @@ saveTiming conn now mid p t =
     \  updated_at  = excluded.updated_at"
     (mid, p, formatClock (ptAzan t), formatClock (ptJamaat t), formatTimestamp now)
 
-searchMosques :: Connection -> Int -> Text -> IO [Mosque]
+-- Nothing means no limit; SQLite treats a negative LIMIT as none.
+searchMosques :: Connection -> Maybe Int -> Text -> IO [Mosque]
 searchMosques conn limit q =
   query conn
     "SELECT id, name, address, lat, lng, timezone FROM mosques \
@@ -73,7 +77,7 @@ searchMosques conn limit q =
     \  AND (instr(lower(name), lower(?)) > 0 OR instr(lower(address), lower(?)) > 0) \
     \ORDER BY name COLLATE NOCASE \
     \LIMIT ?"
-    (prayerCount, q, q, limit)
+    (prayerCount, q, q, fromMaybe (-1) limit)
   where
     prayerCount = length [minBound .. maxBound :: Prayer]
 
@@ -84,11 +88,11 @@ getLastUpdated conn mid = do
     [Only (Just t)] -> parseTimestamp t
     _               -> Nothing
 
-createMosque :: Connection -> Text -> Text -> Text -> IO MosqueId
-createMosque conn name address timezone = do
+createMosque :: Connection -> Text -> Text -> Text -> Coords -> IO MosqueId
+createMosque conn name address timezone (Coords lat lng) = do
   execute conn
-    "INSERT INTO mosques (name, address, timezone) VALUES (?, ?, ?)"
-    (name, address, timezone)
+    "INSERT INTO mosques (name, address, lat, lng, timezone) VALUES (?, ?, ?, ?, ?)"
+    (name, address, lat, lng, timezone)
   MosqueId <$> lastInsertRowId conn
 
 updateMosque :: Connection -> MosqueId -> Text -> Text -> Text -> IO ()
@@ -125,6 +129,12 @@ incrementCodeAttempts conn email =
 deleteSignInCode :: Connection -> Text -> IO ()
 deleteSignInCode conn email =
   execute conn "DELETE FROM sign_in_codes WHERE email = ?" (Only email)
+
+-- Timestamps share one fixed format, so comparing them as text compares them as times.
+deleteExpired :: Connection -> UTCTime -> IO ()
+deleteExpired conn now = do
+  execute conn "DELETE FROM sign_in_codes WHERE expires_at <= ?" (Only (formatTimestamp now))
+  execute conn "DELETE FROM sessions WHERE expires_at <= ?" (Only (formatTimestamp now))
 
 findOrCreateUser :: Connection -> UTCTime -> Text -> IO User
 findOrCreateUser conn now email = do

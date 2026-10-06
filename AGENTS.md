@@ -1,4 +1,6 @@
 ## Workflow
+- Never produce code unless I explicitly tell you to.
+- Only produce code when all the relevant design and architectural decisions have been taken and conveyed by me.
 - When producing code, give complete files, never fragments, and list which files are new, replaced, or deleted.
 - Work from the files I provide in this conversation, not from memory of earlier versions.
 - Keep the design simple enough. Never add unnecessary abstractions or optimisations unless necessary and ratified from me.

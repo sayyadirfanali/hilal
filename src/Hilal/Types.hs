@@ -3,14 +3,17 @@ module Hilal.Types
   , prayerToText
   , prayerFromText
   , prayerLabel
+  , prayerUrdu
   , PrayerTime (..)
   , hasAllTimings
   , parseClock
   , formatClock
   , formatTimestamp
   , parseTimestamp
+  , Coords (..)
   , MosqueId (..)
   , Mosque (..)
+  , mosqueCoords
   , UserId (..)
   , User (..)
   , SignInCode (..)
@@ -54,6 +57,17 @@ prayerLabel p = case p of
   Maghrib -> "Maghrib"
   Isha    -> "Isha"
   Jumuah  -> "Jumu'ah"
+
+-- As written on mosque boards in India. The Urdu font is cut down to these
+-- letters, so any new Urdu text must also be added to install_vendor.sh.
+prayerUrdu :: Prayer -> Text
+prayerUrdu p = case p of
+  Fajr    -> "فجر"
+  Zuhr    -> "ظہر"
+  Asr     -> "عصر"
+  Maghrib -> "مغرب"
+  Isha    -> "عشاء"
+  Jumuah  -> "جمعہ"
 
 instance ToField Prayer where
   toField = toField . prayerToText
@@ -103,6 +117,12 @@ timestampField = fieldWith $ \f -> do
 hasAllTimings :: [(Prayer, PrayerTime)] -> Bool
 hasAllTimings timings = all (`elem` map fst timings) [minBound .. maxBound]
 
+data Coords = Coords
+  { coordsLat :: Double -- degrees north
+  , coordsLng :: Double -- degrees east
+  }
+  deriving (Show, Eq)
+
 newtype MosqueId = MosqueId Int64
   deriving (Show, Eq, Ord, FromField, ToField)
 
@@ -110,14 +130,17 @@ data Mosque = Mosque
   { mosqueId       :: MosqueId
   , mosqueName     :: Text
   , mosqueAddress  :: Text
-  , mosqueLat      :: Maybe Double -- latitude, if known
-  , mosqueLng      :: Maybe Double -- longitude, if known
-  , mosqueTimezone :: Text         -- Asia/Kolkata
+  , mosqueLat      :: Double
+  , mosqueLng      :: Double
+  , mosqueTimezone :: Text -- Asia/Kolkata
   }
   deriving (Show, Eq)
 
 instance FromRow Mosque where
   fromRow = Mosque <$> field <*> field <*> field <*> field <*> field <*> field
+
+mosqueCoords :: Mosque -> Coords
+mosqueCoords m = Coords (mosqueLat m) (mosqueLng m)
 
 newtype UserId = UserId Int64
   deriving (Show, Eq, Ord, FromField, ToField)
