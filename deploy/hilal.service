@@ -1,26 +1,21 @@
-# /etc/systemd/system/hilal.service
 [Unit]
 Description=Hilal
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=hilal
-Group=hilal
-WorkingDirectory=/var/lib/hilal
-ExecStart=/usr/local/bin/hilal
-Environment=HILAL_ENV=production
-# BREVO_API_KEY and HILAL_MAIL_FROM; readable only by root.
-EnvironmentFile=/etc/hilal/env
+User=irfan
+Group=irfan
+WorkingDirectory=/home/irfan/hilal
+ExecStart=/home/irfan/hilal/hilal
+EnvironmentFile=/home/irfan/hilal/hilal.env
 Restart=always
 RestartSec=5
 
-# Hilal needs to write only its own folder.
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/hilal
+ReadWritePaths=/home/irfan/hilal
 
 [Install]
 WantedBy=multi-user.target

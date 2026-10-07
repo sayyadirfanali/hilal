@@ -226,20 +226,47 @@ Modules:
 - `Hilal.App`: routes and configuration.
 
 ## Deployment
-Hilal runs as a single binary at `hilal.irfanali.org`, on a Fedora VPS that also serves other sites, behind Nginx as a reverse proxy.
-It is built on the VPS with ghcup, as on the development machine, so it links against Fedora's own libraries.
-It runs as a systemd service under its own `hilal` user, from `/var/lib/hilal`, where `hilal.db` and `edits.log` live.
-The Brevo key and sender address are in `/etc/hilal/env`, readable only by root, never in git.
-`deploy/` holds the systemd unit, the Nginx configuration, and the steps.
-Nginx's certificate comes from Let's Encrypt through certbot.
-The proxy terminates HTTPS and compresses responses; Hilal itself speaks plain HTTP on port 8080.
+Hilal runs at `hilal.irfanali.org`, on a Fedora VPS that also serves other sites, behind Nginx as a reverse proxy.
+It is deployed the same way as those sites: a folder in the owner's home, synced from the development machine, run by systemd under the owner's own user.
+Keeping it to a folder, one program, one SQLite file, systemd, and Nginx means there is no container, CI, or database server to maintain.
+
+`make deploy` does everything from the development machine, over SSH:
+
+1. rsync copies the folder to the server, skipping `.git/` and everything `.gitignore` lists, with `--delete`;
+2. the server builds Hilal with ghcup, so it links against Fedora's own libraries, and installs the program as `hilal` in the folder;
+3. it copies `deploy/hilal.service` to `/etc/systemd/system/` and restarts Hilal.
+
+Each step runs only if the one before succeeded, so a failed build never replaces the running program.
+Replacing the program file doesn't stop the running one; the restart switches to it.
+`make vendor` downloads Tailwind, daisyUI, MapLibre and the fonts on the server, once and whenever `install_vendor.sh` changes, because they are built for each machine.
+`make status` and `make log` show the service's state and output.
+The server's SSH host and folder are in `config.mk`, which git ignores.
+
+What exists only on the server is listed in `.gitignore`, so rsync neither sends it nor deletes it: the built `hilal`, `hilal.db` and `edits.log`, the downloaded `vendor/`, and `hilal.env`.
+The local test database is never copied over by a deploy; when that is wanted before launch, it is copied by hand with Hilal stopped.
+Hilal never seeds its database; `seed_db.sh` is for the development machine only.
+Until launch, a schema change means deleting `hilal.db` on the server too, losing its data.
+
+`deploy/` holds the two files the server needs:
+
+- `hilal.service`, the systemd unit, which runs `hilal` from the folder, sets `HILAL_ENV=production`, reads `hilal.env`, restarts Hilal if it stops, and lets it write only its own folder;
+- `hilal.nginx.conf`, installed once by hand as `/etc/nginx/conf.d/hilal.conf`, because certbot then adds HTTPS to the installed copy, and copying it again would remove that.
+
+Hilal reads these environment variables:
+
+- `HILAL_ENV=production`, set in the unit, makes cookies `Secure` and makes Hilal refuse to start with a demo code or without the two below;
+- `BREVO_API_KEY` and `HILAL_MAIL_FROM`, in `hilal.env`, send sign-in codes by email;
+- `HILAL_DEMO_CODE`, never set on the server, makes every code that value, for offline demos.
+
+`hilal.env` is created by hand on the server, readable only by its owner, and is never synced or committed.
+Without these variables, as when running locally with `cabal run`, codes are printed to the terminal instead.
+
+Nginx terminates HTTPS, with a certificate from Let's Encrypt through certbot, and compresses responses; Hilal itself speaks plain HTTP on port 8080.
 Hilal listens on every interface, so the firewall must keep port 8080 closed to the outside, leaving the proxy as the only way in.
 The proxy must pass the original `Host` header through, because the cross-site check compares it with `Origin`; otherwise every POST is refused.
-The proxy's access log must be turned off, or must leave out query strings, because the nearby list carries the phone's location in its address.
+The proxy's access log is turned off, because the nearby list carries the phone's location in its address.
 Its error log is kept at the `crit` level for the same reason, because lower levels record the request line when Hilal is down.
 Hilal reads no forwarded-address headers, because it never uses visitors' IP addresses.
-`HILAL_ENV=production` must be set, which makes cookies `Secure` and refuses to start with a demo code.
-Until launch, a schema change still means deleting `hilal.db` on the server too, losing its data.
 
 ## Frontend
 Styling is Tailwind CSS v4 with daisyUI v5, built with Tailwind's standalone executable, so no Node is needed.
@@ -295,5 +322,6 @@ What a person follows is stored, because following needs it, and is visible to n
 - A primary mosque, if many people follow several mosques.
 - Mosque admins, if community editing stops working at scale.
 - Account deletion, a privacy page, and privacy obligations, since followed mosques reveal religious affiliation; Play requires a privacy policy.
-- Rotating and backing up `edits.log`, and backing up `hilal.db`.
+- Backing up `hilal.db` daily, with SQLite's `.backup`, since copying the file while Hilal runs can give an inconsistent copy; and rotating `edits.log`.
+- Keeping the previous `hilal` program on the server, for a quick rollback.
 - Publishing on Play and F-Droid.
