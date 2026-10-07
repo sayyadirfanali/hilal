@@ -19,6 +19,7 @@ library
     Hilal.Auth
     Hilal.DB
     Hilal.Edit
+    Hilal.Email
     Hilal.Hijri
     Hilal.HijriTable
     Hilal.JSON

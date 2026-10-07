@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Control.Monad (filterM, forM_)
+import Control.Monad (filterM, forM_, replicateM_)
 import Data.Aeson (decode, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -9,7 +9,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Char (isDigit)
 import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef, newIORef, readIORef)
-import Data.List (sort)
+import Data.List (sort, sortOn)
 import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -27,7 +27,19 @@ import Test.Hspec.Wai
 
 import Hilal.App (Config (..), app)
 import Hilal.Assets (interFontPath, maplibreJsPath)
-import Hilal.Auth (CodeCheck (..), canResend, checkCode, newCode, normaliseEmail, safeNext, sameOrigin, sessionToken, sha256)
+import Hilal.Auth
+  ( CodeCheck (..)
+  , canResend
+  , checkCode
+  , maxCodesPerDay
+  , maxWrongCodesPerDay
+  , newCode
+  , normaliseEmail
+  , safeNext
+  , sameOrigin
+  , sessionToken
+  , sha256
+  )
 import Hilal.DB (withDb)
 import Hilal.Edit (MosqueForm (..), ValidMosque (..), changedTimings, editLog, emptyForm, validateForm, validateNew)
 import Hilal.Hijri (HijriDate (..), HijriPart (..), hijriFromDay, hijriParts)
@@ -35,7 +47,10 @@ import Hilal.JSON (followedJson, timingsJson)
 import Hilal.Location (distanceMeters, locate, parseLocation, shortLink)
 import Hilal.Migrate (migrate)
 import Hilal.Query
-  ( createMosque
+  ( clearWrongCodes
+  , countSentCodes
+  , countWrongCodes
+  , createMosque
   , deleteExpired
   , deleteSignInCode
   , findOrCreateUser
@@ -51,6 +66,8 @@ import Hilal.Query
   , isFollowing
   , killSession
   , makeSession
+  , recordSentCode
+  , recordWrongCode
   , saveSignInCode
   , saveTiming
   , searchMosques
@@ -150,6 +167,12 @@ readCodes = getState >>= liftIO . readIORef . stateCodes
 
 readLog :: WaiSession TestState [Text]
 readLog = getState >>= liftIO . readIORef . stateLog
+
+-- Runs queries on the app's own database, for state the app's routes can't reach quickly.
+withStateDb :: (Connection -> IO a) -> WaiSession TestState a
+withStateDb action = do
+  db <- stateDb <$> getState
+  liftIO (withDb db action)
 
 signIn :: WaiSession TestState ByteString
 signIn = do
@@ -721,8 +744,8 @@ main = hspec $ do
 
     it "belong only to their own mosque" $
       withTestDb $ \conn -> do
-        saveTiming conn noon (MosqueId 1) Fajr (timesAt 5)
-        getTimings conn (MosqueId 1) `shouldReturn` [(Fajr, timesAt 5)]
+        saveTiming conn later (MosqueId 1) Fajr (timesAt 6)
+        sortOn fst <$> getTimings conn (MosqueId 2) `shouldReturn` allSix
 
     it "can't be saved for a mosque that doesn't exist" $
       withTestDb $ \conn ->
@@ -810,7 +833,36 @@ main = hspec $ do
         deleteSignInCode conn "reader@example.com"
         getSignInCode conn "reader@example.com" `shouldReturn` Nothing
 
-  describe "deleteExpired" $
+  describe "sent codes" $ do
+    it "are counted after the given time" $
+      withTestDb $ \conn -> do
+        recordSentCode conn noon "reader@example.com"
+        recordSentCode conn later "reader@example.com"
+        countSentCodes conn noon "reader@example.com" `shouldReturn` 1
+        countSentCodes conn (addUTCTime (-1) noon) "reader@example.com" `shouldReturn` 2
+
+    it "are counted per email" $
+      withTestDb $ \conn -> do
+        recordSentCode conn later "reader@example.com"
+        countSentCodes conn noon "other@example.com" `shouldReturn` 0
+
+  describe "wrong codes" $ do
+    it "are counted after the given time" $
+      withTestDb $ \conn -> do
+        recordWrongCode conn noon "reader@example.com"
+        recordWrongCode conn later "reader@example.com"
+        countWrongCodes conn noon "reader@example.com" `shouldReturn` 1
+        countWrongCodes conn (addUTCTime (-1) noon) "reader@example.com" `shouldReturn` 2
+
+    it "can be cleared for one email" $
+      withTestDb $ \conn -> do
+        recordWrongCode conn later "reader@example.com"
+        recordWrongCode conn later "other@example.com"
+        clearWrongCodes conn "reader@example.com"
+        countWrongCodes conn noon "reader@example.com" `shouldReturn` 0
+        countWrongCodes conn noon "other@example.com" `shouldReturn` 1
+
+  describe "deleteExpired" $ do
     it "removes expired codes and sessions, and keeps current ones" $
       withTestDb $ \conn -> do
         user <- findOrCreateUser conn noon "reader@example.com"
@@ -818,11 +870,22 @@ main = hspec $ do
         saveSignInCode conn later (addUTCTime 600 later) "new@example.com" "hash"
         makeSession conn noon later (userId user) "old-token"
         makeSession conn noon (addUTCTime 600 later) (userId user) "new-token"
-        deleteExpired conn later
+        deleteExpired conn later noon
         getSignInCode conn "old@example.com" `shouldReturn` Nothing
         isJust <$> getSignInCode conn "new@example.com" `shouldReturn` True
         tokens <- query_ conn "SELECT token_hash FROM sessions"
         map fromOnly tokens `shouldBe` ["new-token" :: Text]
+
+    it "removes records of codes from before the given time" $
+      withTestDb $ \conn -> do
+        recordSentCode conn noon "reader@example.com"
+        recordSentCode conn later "reader@example.com"
+        recordWrongCode conn noon "reader@example.com"
+        recordWrongCode conn later "reader@example.com"
+        deleteExpired conn later noon
+        let before = addUTCTime (-1) noon
+        countSentCodes conn before "reader@example.com" `shouldReturn` 1
+        countWrongCodes conn before "reader@example.com" `shouldReturn` 1
 
   describe "users" $ do
     it "are created once per email" $
@@ -1022,11 +1085,9 @@ main = hspec $ do
         liftIO (codes `shouldBe` [])
 
       it "refuses a code issued before the user was blocked" $ do
-        db <- stateDb <$> getState
-        liftIO $ do
+        withStateDb $ \conn -> do
           now <- getCurrentTime
-          withDb db $ \conn ->
-            saveSignInCode conn now (addUTCTime 600 now) "blocked@example.com" (sha256 "123456")
+          saveSignInCode conn now (addUTCTime 600 now) "blocked@example.com" (sha256 "123456")
         response <- postForm "/sign-in/code" [] "email=blocked%40example.com&code=123456"
         liftIO (lookup "Set-Cookie" (simpleHeaders response) `shouldBe` Nothing)
 
@@ -1064,6 +1125,51 @@ main = hspec $ do
         postForm "/sign-in" [("Origin", "http://localhost"), ("Host", "localhost")]
           "email=reader%40example.com"
           `shouldRespondWith` 200
+
+    describe "daily sign-in limits" $ do
+      it "count the codes sent and the wrong codes entered" $ do
+        postForm "/sign-in" [] "email=reader%40example.com" `shouldRespondWith` 200
+        postForm "/sign-in/code" [] "email=reader%40example.com&code=wrong" `shouldRespondWith` 200
+        counts <- withStateDb $ \conn -> do
+          now <- getCurrentTime
+          let since = addUTCTime (-3600) now
+          (,) <$> countSentCodes conn since "reader@example.com"
+              <*> countWrongCodes conn since "reader@example.com"
+        liftIO (counts `shouldBe` (1, 1))
+
+      it "stop sending codes once the day's codes are used up" $ do
+        withStateDb $ \conn -> do
+          now <- getCurrentTime
+          replicateM_ maxCodesPerDay (recordSentCode conn (addUTCTime (-120) now) "reader@example.com")
+        postForm "/sign-in" [] "email=reader%40example.com" `shouldRespondWith` 429
+        codes <- readCodes
+        liftIO (codes `shouldBe` [])
+
+      it "stop sending codes after too many wrong ones in a day" $ do
+        withStateDb $ \conn -> do
+          now <- getCurrentTime
+          replicateM_ maxWrongCodesPerDay (recordWrongCode conn (addUTCTime (-120) now) "reader@example.com")
+        postForm "/sign-in" [] "email=reader%40example.com" `shouldRespondWith` 429
+        codes <- readCodes
+        liftIO (codes `shouldBe` [])
+
+      it "refuse even the right code after too many wrong ones in a day" $ do
+        withStateDb $ \conn -> do
+          now <- getCurrentTime
+          saveSignInCode conn now (addUTCTime 600 now) "reader@example.com" (sha256 "123456")
+          replicateM_ maxWrongCodesPerDay (recordWrongCode conn (addUTCTime (-120) now) "reader@example.com")
+        response <- postForm "/sign-in/code" [] "email=reader%40example.com&code=123456"
+        liftIO (lookup "Set-Cookie" (simpleHeaders response) `shouldBe` Nothing)
+
+      it "forget wrong codes after signing in" $ do
+        withStateDb $ \conn -> do
+          now <- getCurrentTime
+          replicateM_ 3 (recordWrongCode conn (addUTCTime (-120) now) "reader@example.com")
+        _ <- signIn
+        wrong <- withStateDb $ \conn -> do
+          now <- getCurrentTime
+          countWrongCodes conn (addUTCTime (-3600) now) "reader@example.com"
+        liftIO (wrong `shouldBe` 0)
 
     describe "the account page" $ do
       it "asks you to sign in first, then returns" $

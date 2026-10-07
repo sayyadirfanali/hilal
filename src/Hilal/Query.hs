@@ -10,6 +10,11 @@ module Hilal.Query
   , getSignInCode
   , incrementCodeAttempts
   , deleteSignInCode
+  , recordSentCode
+  , countSentCodes
+  , recordWrongCode
+  , countWrongCodes
+  , clearWrongCodes
   , deleteExpired
   , findOrCreateUser
   , isBlocked
@@ -130,11 +135,50 @@ deleteSignInCode :: Connection -> Text -> IO ()
 deleteSignInCode conn email =
   execute conn "DELETE FROM sign_in_codes WHERE email = ?" (Only email)
 
+recordSentCode :: Connection -> UTCTime -> Text -> IO ()
+recordSentCode conn now email =
+  execute conn
+    "INSERT INTO sent_codes (email, created_at) VALUES (?, ?)"
+    (email, formatTimestamp now)
+
+-- Codes sent to an email after the given time.
+countSentCodes :: Connection -> UTCTime -> Text -> IO Int
+countSentCodes conn since email = do
+  rows <- query conn
+    "SELECT COUNT(*) FROM sent_codes WHERE email = ? AND created_at > ?"
+    (email, formatTimestamp since)
+  return $ case rows of
+    [Only n] -> n
+    _        -> 0
+
+recordWrongCode :: Connection -> UTCTime -> Text -> IO ()
+recordWrongCode conn now email =
+  execute conn
+    "INSERT INTO wrong_codes (email, created_at) VALUES (?, ?)"
+    (email, formatTimestamp now)
+
+-- Wrong codes entered for an email after the given time.
+countWrongCodes :: Connection -> UTCTime -> Text -> IO Int
+countWrongCodes conn since email = do
+  rows <- query conn
+    "SELECT COUNT(*) FROM wrong_codes WHERE email = ? AND created_at > ?"
+    (email, formatTimestamp since)
+  return $ case rows of
+    [Only n] -> n
+    _        -> 0
+
+clearWrongCodes :: Connection -> Text -> IO ()
+clearWrongCodes conn email =
+  execute conn "DELETE FROM wrong_codes WHERE email = ?" (Only email)
+
 -- Timestamps share one fixed format, so comparing them as text compares them as times.
-deleteExpired :: Connection -> UTCTime -> IO ()
-deleteExpired conn now = do
+-- Records of codes sent and wrong codes are only needed after `since`, for the daily limits.
+deleteExpired :: Connection -> UTCTime -> UTCTime -> IO ()
+deleteExpired conn now since = do
   execute conn "DELETE FROM sign_in_codes WHERE expires_at <= ?" (Only (formatTimestamp now))
   execute conn "DELETE FROM sessions WHERE expires_at <= ?" (Only (formatTimestamp now))
+  execute conn "DELETE FROM sent_codes WHERE created_at <= ?" (Only (formatTimestamp since))
+  execute conn "DELETE FROM wrong_codes WHERE created_at <= ?" (Only (formatTimestamp since))
 
 findOrCreateUser :: Connection -> UTCTime -> Text -> IO User
 findOrCreateUser conn now email = do

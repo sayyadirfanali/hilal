@@ -1,5 +1,6 @@
 module Hilal.App (Config (..), app) where
 
+import Control.Exception (SomeException, try)
 import Control.Monad (forM, forM_, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as BL
@@ -14,9 +15,10 @@ import Data.Time (LocalTime, UTCTime, addUTCTime, getCurrentTime, localDay)
 import Data.Time.Zones (utcToLocalTimeTZ)
 import Database.SQLite.Simple (withTransaction)
 import Lucid (Html, renderText)
-import Network.HTTP.Types.Status (status304, status400, status401, status403, status404)
+import Network.HTTP.Types.Status (status304, status400, status401, status403, status404, status429, status503)
 import Network.Wai (Application)
 import Numeric (showHex)
+import System.IO (hPutStrLn, stderr)
 import Web.Scotty hiding (next)
 
 import Hilal.Assets (fnv1a, interFont, maplibreCss, maplibreJs, urduFont)
@@ -26,6 +28,8 @@ import Hilal.Auth
   , checkCode
   , clearSessionCookie
   , codeLifetime
+  , maxCodesPerDay
+  , maxWrongCodesPerDay
   , newCode
   , newToken
   , normaliseEmail
@@ -35,6 +39,7 @@ import Hilal.Auth
   , sessionLifetime
   , sessionToken
   , sha256
+  , windowStart
   )
 import Hilal.DB (withDb)
 import Hilal.Edit
@@ -52,7 +57,10 @@ import Hilal.Edit
 import Hilal.JSON (followedJson, notFoundJson, notSignedInJson, timingsJson)
 import Hilal.Location (coordsFromParams, distanceMeters, locate)
 import Hilal.Query
-  ( createMosque
+  ( clearWrongCodes
+  , countSentCodes
+  , countWrongCodes
+  , createMosque
   , deleteExpired
   , deleteSignInCode
   , findOrCreateUser
@@ -68,6 +76,8 @@ import Hilal.Query
   , isFollowing
   , killSession
   , makeSession
+  , recordSentCode
+  , recordWrongCode
   , saveSignInCode
   , saveTiming
   , searchMosques
@@ -95,13 +105,13 @@ data Config = Config
   { configDb            :: FilePath
   , configSecureCookies :: Bool
   , configSuperadmin    :: Text
-  , configSendCode      :: Text -> Text -> IO ()
+  , configSendCode      :: Text -> Text -> IO ()      -- throws when the code can't be sent
   , configLogEdit       :: Text -> IO ()
   , configDemoCode      :: Maybe Text                -- every sign-in code, for demos; never in production
   , configResolveLink   :: Text -> IO (Maybe Text)   -- where a Google Maps short link points
   }
 
-data SendOutcome = CodeSent | CodeTooSoon | EmailBlocked
+data SendOutcome = CodeSent | CodeTooSoon | TooManyCodes | TooManyWrongCodes | SendFailed | EmailBlocked
 
 data FollowAction = Follow | Unfollow
 
@@ -264,24 +274,35 @@ app cfg = scottyApp $ do
       Just email -> do
         now <- liftIO getCurrentTime
         outcome <- liftIO $ withDb dbPath $ \conn -> do
-          deleteExpired conn now
-          blocked <- isBlocked conn email
+          let since = windowStart now
+          deleteExpired conn now since
+          blocked  <- isBlocked conn email
+          wrong    <- countWrongCodes conn since email
+          sent     <- countSentCodes conn since email
           existing <- getSignInCode conn email
-          if blocked
-            then return EmailBlocked
-            else
-              if maybe True (canResend now) existing
-                then do
-                  code <- maybe newCode return (configDemoCode cfg)
-                  saveSignInCode conn now (addUTCTime codeLifetime now) email (sha256 code)
-                  configSendCode cfg email code
-                  return CodeSent
-                else return CodeTooSoon
+          let decision
+                | blocked                                   = EmailBlocked
+                | wrong >= maxWrongCodesPerDay              = TooManyWrongCodes
+                | sent >= maxCodesPerDay                    = TooManyCodes
+                | not (maybe True (canResend now) existing) = CodeTooSoon
+                | otherwise                                 = CodeSent
+          case decision of
+            CodeSent -> sendNewCode conn now email
+            _        -> return decision
         case outcome of
           CodeSent ->
             page (codePage email next Nothing)
           CodeTooSoon ->
             page (codePage email next (Just "We sent you a code less than a minute ago. Check your email, or try again shortly."))
+          TooManyCodes -> do
+            status status429
+            page (codePage email next (Just "We've sent this email too many codes today, so we can't send another until tomorrow. If you have a recent code, enter it here."))
+          TooManyWrongCodes -> do
+            status status429
+            page (signInPage input next (Just tooManyWrongCodes))
+          SendFailed -> do
+            status status503
+            page (signInPage input next (Just "We couldn't send the email. Please try again in a minute."))
           EmailBlocked -> do
             status status403
             page (signInPage input next (Just "This email address can't be used to sign in."))
@@ -292,29 +313,34 @@ app cfg = scottyApp $ do
     code  <- T.strip <$> textParam "code"
     now <- liftIO getCurrentTime
     result <- liftIO $ withDb dbPath $ \conn -> do
+      wrong  <- countWrongCodes conn (windowStart now) email
       stored <- getSignInCode conn email
-      case checkCode now code <$> stored of
-        Nothing ->
-          return (Left "That code has expired. Please request a new one.")
-        Just CodeOk -> do
-          deleteSignInCode conn email
-          blocked <- isBlocked conn email
-          if blocked
-            then return (Left "This email address can't be used to sign in.")
-            else do
-              user <- findOrCreateUser conn now email
-              token <- newToken
-              makeSession conn now (addUTCTime sessionLifetime now) (userId user) (sha256 token)
-              return (Right token)
-        Just CodeWrong -> do
-          incrementCodeAttempts conn email
-          return (Left "That code isn't right. Please check it and try again.")
-        Just CodeExpired -> do
-          deleteSignInCode conn email
-          return (Left "That code has expired. Please request a new one.")
-        Just CodeLocked -> do
-          deleteSignInCode conn email
-          return (Left "Too many wrong attempts. Please request a new code.")
+      if wrong >= maxWrongCodesPerDay
+        then return (Left tooManyWrongCodes)
+        else case checkCode now code <$> stored of
+          Nothing ->
+            return (Left "That code has expired. Please request a new one.")
+          Just CodeOk -> do
+            deleteSignInCode conn email
+            blocked <- isBlocked conn email
+            if blocked
+              then return (Left "This email address can't be used to sign in.")
+              else do
+                user <- findOrCreateUser conn now email
+                clearWrongCodes conn email
+                token <- newToken
+                makeSession conn now (addUTCTime sessionLifetime now) (userId user) (sha256 token)
+                return (Right token)
+          Just CodeWrong -> do
+            incrementCodeAttempts conn email
+            recordWrongCode conn now email
+            return (Left "That code isn't right. Please check it and try again.")
+          Just CodeExpired -> do
+            deleteSignInCode conn email
+            return (Left "That code has expired. Please request a new one.")
+          Just CodeLocked -> do
+            deleteSignInCode conn email
+            return (Left "Too many wrong attempts. Please request a new code.")
     case result of
       Right token -> do
         setCookieHeader (sessionCookie (configSecureCookies cfg) token)
@@ -336,6 +362,24 @@ app cfg = scottyApp $ do
   notFound notFoundResponse
   where
     dbPath = configDb cfg
+
+    -- A code that couldn't be sent is forgotten, so asking again needn't wait a minute.
+    -- Only the failure is logged: the exception may carry the address and the API key.
+    sendNewCode conn now email = do
+      code <- maybe newCode return (configDemoCode cfg)
+      saveSignInCode conn now (addUTCTime codeLifetime now) email (sha256 code)
+      result <- try @SomeException (configSendCode cfg email code)
+      case result of
+        Right () -> do
+          recordSentCode conn now email
+          return CodeSent
+        Left _ -> do
+          deleteSignInCode conn email
+          hPutStrLn stderr "A sign-in email could not be sent."
+          return SendFailed
+
+tooManyWrongCodes :: Text
+tooManyWrongCodes = "Too many wrong codes for this email today. Please try again tomorrow."
 
 changeFollow :: FilePath -> FollowAction -> Text -> ActionM ()
 changeFollow dbPath action idText = do
