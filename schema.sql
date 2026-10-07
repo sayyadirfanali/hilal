@@ -32,6 +32,18 @@ CREATE TABLE IF NOT EXISTS sign_in_codes (
   expires_at  TEXT NOT NULL         -- UTC ISO-8601
 );
 
+-- Every code sent, kept for a day, for the daily limit on codes sent.
+CREATE TABLE IF NOT EXISTS sent_codes (
+  email       TEXT NOT NULL,        -- trimmed, lowercase
+  created_at  TEXT NOT NULL         -- UTC ISO-8601
+);
+
+-- Every wrong code entered, kept for a day, for the daily limit on wrong codes.
+CREATE TABLE IF NOT EXISTS wrong_codes (
+  email       TEXT NOT NULL,        -- trimmed, lowercase
+  created_at  TEXT NOT NULL         -- UTC ISO-8601
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash  TEXT PRIMARY KEY,     -- SHA-256 hex
   user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

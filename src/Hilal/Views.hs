@@ -75,7 +75,7 @@ layout title tab band content = do
     body_ [class_ "min-h-screen bg-base-200 text-base-content antialiased"] $ do
       header_ [class_ "hilal-band"] $
         div_ [class_ "mx-auto max-w-xl px-4 pt-3 pb-5"] $ do
-          a_ [href_ "/", class_ "mb-3 inline-flex items-center gap-1.5 text-sm font-medium text-secondary"] $ do
+          a_ [href_ "/", class_ "mb-3 inline-flex items-center gap-2 text-lg font-semibold text-secondary"] $ do
             crescent
             "Hilal"
           band
@@ -141,7 +141,7 @@ userIcon = svgIcon "<path d=\"M8 7a4 4 0 1 0 8 0a4 4 0 0 0-8 0\"/><path d=\"M6 2
 crescent :: Html ()
 crescent =
   toHtmlRaw
-    ("<svg viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" aria-hidden=\"true\">\
+    ("<svg viewBox=\"0 0 24 24\" width=\"24\" height=\"24\" aria-hidden=\"true\">\
      \<path fill=\"currentColor\" d=\"M20 14.5A8.5 8.5 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z\"/>\
      \</svg>" :: Text)
 
@@ -454,6 +454,9 @@ formatDistance meters
 showDouble :: Double -> Text
 showDouble = T.pack . show
 
+-- The timings table fits a 320 px screen: Urdu goes under the English, cells are
+-- narrower on phones, and the box scrolls rather than cutting a column off.
+-- The next prayer's row is highlighted and framed in gold, like the gold card above.
 mosquePage
   :: Mosque
   -> [(Prayer, PrayerTime)]
@@ -465,19 +468,13 @@ mosquePage
 mosquePage mosque timings now next updated followState =
   layout (mosqueName mosque <> " · Prayer times") NoTab band $ do
     forM_ next nextCard
-    div_ [class_ "overflow-hidden rounded-box border border-base-300 bg-base-100"] $
+    div_ [class_ "overflow-x-auto rounded-box border border-base-300 bg-base-100"] $
       table_ [class_ "table"] $ do
         thead_ $
           tr_ [class_ "text-base-content/70"] $ do
-            th_ $ do
-              "Prayer "
-              urdu "text-accent" "نماز"
-            th_ $ do
-              "Azan "
-              urdu "text-accent" "اذان"
-            th_ $ do
-              "Jamaat "
-              urdu "text-accent" "جماعت"
+            th_ [class_ "px-2 sm:px-4"] (heading "Prayer" "نماز")
+            th_ [class_ "px-2 sm:px-4"] (heading "Azan" "اذان")
+            th_ [class_ "px-2 sm:px-4"] (heading "Jamaat" "جماعت")
         tbody_ $
           mapM_ row [minBound .. maxBound :: Prayer]
     forM_ updated $ \d ->
@@ -511,20 +508,21 @@ mosquePage mosque timings now next updated followState =
           " "
           span_ [class_ "text-lg font-medium"] (toHtml (clockPeriod (njTime n)))
         p_ [class_ "mt-1 text-sm text-base-content/70"] (countdownSpan n)
+    heading :: Text -> Text -> Html ()
+    heading english urduText = do
+      div_ (toHtml english)
+      div_ (urdu "text-accent" urduText)
     row prayer =
-      tr_ (if nextPrayerOnly == Just prayer then [class_ "bg-secondary/15"] else []) $ do
-        th_ [scope_ "row", class_ "font-semibold"] $ do
-          toHtml (prayerLabel prayer)
-          " "
-          urdu "font-normal text-accent" (prayerUrdu prayer)
-          when (nextPrayerOnly == Just prayer) $
-            span_ [class_ "badge badge-secondary badge-sm ml-2"] "Next"
+      tr_ (if nextPrayerOnly == Just prayer then [class_ "bg-secondary/15 outline-2 -outline-offset-2 outline-secondary"] else []) $ do
+        th_ [scope_ "row", class_ "px-2 font-semibold sm:px-4"] $ do
+          div_ (toHtml (prayerLabel prayer))
+          div_ (urdu "font-normal text-accent" (prayerUrdu prayer))
         case lookup prayer timings of
           Just t -> do
-            td_ [class_ "whitespace-nowrap tabular-nums text-base-content/70"] (clock (ptAzan t))
-            td_ [class_ "whitespace-nowrap text-lg font-semibold tabular-nums"] (clock (ptJamaat t))
+            td_ [class_ "whitespace-nowrap px-2 tabular-nums text-base-content/70 sm:px-4"] (clock (ptAzan t))
+            td_ [class_ "whitespace-nowrap px-2 text-lg font-semibold tabular-nums sm:px-4"] (clock (ptJamaat t))
           Nothing ->
-            td_ [colspan_ "2", class_ "text-base-content/60"] "Not set"
+            td_ [colspan_ "2", class_ "px-2 text-base-content/60 sm:px-4"] "Not set"
 
 followButton :: MosqueId -> FollowState -> Html ()
 followButton mid state = case state of
@@ -651,11 +649,12 @@ longDate = T.pack . formatTime defaultTimeLocale "%A, %-d %B"
 shortDate :: Day -> Text
 shortDate = T.pack . formatTime defaultTimeLocale "%-d %B %Y"
 
+-- AM/PM is set small, so the digits carry the time and narrow columns stay narrow.
 clock :: TimeOfDay -> Html ()
 clock t = do
   toHtml (clockDigits t)
   " "
-  span_ [class_ "text-xs font-normal text-base-content/60"] (toHtml (clockPeriod t))
+  span_ [class_ "text-[0.625rem] font-normal text-base-content/60"] (toHtml (clockPeriod t))
 
 clockDigits :: TimeOfDay -> Text
 clockDigits = T.pack . formatTime defaultTimeLocale "%-I:%M"

@@ -4,6 +4,9 @@ module Hilal.Auth
   , canResend
   , codeLifetime
   , sessionLifetime
+  , windowStart
+  , maxCodesPerDay
+  , maxWrongCodesPerDay
   , newCode
   , newToken
   , sha256
@@ -25,7 +28,7 @@ import Data.Char (isSpace)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
-import Data.Time (NominalDiffTime, UTCTime, diffUTCTime)
+import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime)
 import Numeric (showHex)
 import Web.Cookie (SetCookie (..), defaultSetCookie, parseCookiesText, renderSetCookie, sameSiteLax)
 
@@ -45,6 +48,21 @@ sessionLifetime = 365 * 24 * 60 * 60
 
 maxAttempts :: Int
 maxAttempts = 5
+
+-- The daily limits count over the last 24 hours, not since midnight.
+limitWindow :: NominalDiffTime
+limitWindow = 24 * 60 * 60
+
+windowStart :: UTCTime -> UTCTime
+windowStart = addUTCTime (negate limitWindow)
+
+-- So nobody can flood an inbox with codes.
+maxCodesPerDay :: Int
+maxCodesPerDay = 20
+
+-- So guessing a code is hopeless: 20 guesses a day at one in a million each.
+maxWrongCodesPerDay :: Int
+maxWrongCodesPerDay = 20
 
 checkCode :: UTCTime -> Text -> SignInCode -> CodeCheck
 checkCode now code stored
