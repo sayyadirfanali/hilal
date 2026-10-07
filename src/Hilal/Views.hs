@@ -4,6 +4,7 @@ module Hilal.Views
   , mosquePage
   , mosquesPage
   , mosqueFormPage
+  , addLinkPage
   , mosqueUrl
   , signInUrl
   , notFoundPage
@@ -542,42 +543,54 @@ followButton mid state = case state of
   where
     url = mosqueUrl mid
 
--- Adding asks for the location, and guesses the time zone on first showing;
+errorList :: [Text] -> Html ()
+errorList errors =
+  unless (null errors) $
+    div_ [role_ "alert", class_ "alert alert-error mb-4"] $
+      ul_ [class_ "list-disc pl-4"] (mapM_ (li_ . toHtml) errors)
+
+-- Adding starts with the mosque's Google Maps link, which gives its name and location.
+addLinkPage :: Text -> [Text] -> Maybe MosqueId -> Html ()
+addLinkPage pasted errors existing =
+  layout "Add a mosque · Hilal" NoTab (bandTitle "Add a mosque") $ do
+    errorList errors
+    forM_ existing $ \mid ->
+      div_ [role_ "alert", class_ "alert alert-warning mb-4"] $
+        span_ $ do
+          "This mosque is already on Hilal. "
+          a_ [href_ (mosqueUrl mid), class_ "link font-semibold"] "See it"
+    form_ [method_ "post", action_ "/mosques/new/link", class_ "flex flex-col gap-4 rounded-box border border-base-300 bg-base-100 p-4"] $ do
+      fieldset_ [class_ "fieldset"] $ do
+        label_ [for_ "location", class_ "fieldset-legend"] "Google Maps link"
+        input_
+          [ type_ "text"
+          , id_ "location"
+          , name_ "location"
+          , value_ pasted
+          , required_ ""
+          , autocomplete_ "off"
+          , placeholder_ "https://maps.app.goo.gl/..."
+          , class_ "input w-full"
+          ]
+        p_ [class_ "label whitespace-normal"]
+          "In Google Maps, open the mosque, tap Share, and paste the link here. Its name and location come from Google Maps."
+      button_ [type_ "submit", class_ "btn btn-primary"] "Continue"
+
+-- The name is shown, not typed: it always comes from Google Maps.
+-- Adding carries the place's link along, and guesses the time zone on first showing;
 -- editing does neither, because a mosque's location doesn't change.
 mosqueFormPage :: Text -> Text -> [Text] -> MosqueForm -> [Prayer] -> Bool -> Html ()
 mosqueFormPage title action errors form upcoming adding =
   layout (title <> " · Hilal") NoTab (bandTitle title) $ do
-    unless (null errors) $
-      div_ [role_ "alert", class_ "alert alert-error mb-4"] $
-        ul_ [class_ "list-disc pl-4"] (mapM_ (li_ . toHtml) errors)
+    errorList errors
     form_ [method_ "post", action_ action, class_ "flex flex-col gap-4"] $ do
+      when adding $
+        input_ [type_ "hidden", name_ "location", value_ (formLocation form)]
       div_ [class_ "rounded-box border border-base-300 bg-base-100 p-4"] $ do
-        when adding $
-          fieldset_ [class_ "fieldset"] $ do
-            label_ [for_ "location", class_ "fieldset-legend"] "Google Maps link"
-            input_
-              [ type_ "text"
-              , id_ "location"
-              , name_ "location"
-              , value_ (formLocation form)
-              , required_ ""
-              , autocomplete_ "off"
-              , placeholder_ "https://maps.app.goo.gl/..."
-              , class_ "input w-full"
-              ]
-            p_ [class_ "label whitespace-normal"]
-              "In Google Maps, open the mosque, tap Share, and paste the link here. Coordinates like 21.2036, 81.3700 work too."
         fieldset_ [class_ "fieldset"] $ do
-          label_ [for_ "name", class_ "fieldset-legend"] "Name"
-          input_
-            [ type_ "text"
-            , id_ "name"
-            , name_ "name"
-            , value_ (formName form)
-            , required_ ""
-            , placeholder_ "Jama Masjid"
-            , class_ "input w-full"
-            ]
+          span_ [class_ "fieldset-legend"] "Name"
+          p_ [class_ "text-base font-semibold"] (toHtml (formName form))
+          p_ [class_ "label whitespace-normal"] "As named on Google Maps."
         fieldset_ [class_ "fieldset"] $ do
           label_ [for_ "address", class_ "fieldset-legend"] "Address"
           input_

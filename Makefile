@@ -2,10 +2,10 @@ include config.mk
 
 .PHONY: sync vendor build install deploy all status log
 
-EXCLUDES = --exclude='.git/' --filter=':- .gitignore' --exclude='dist-newstyle/' --exclude='vendor/'
+EXCLUDES = --include='hilal.env' --exclude='.git/' --filter=':- .gitignore' --exclude='dist-newstyle/' --exclude='vendor/'
 
 sync:
-	rsync -avz --delete $(EXCLUDES) -e ssh ./ $(REMOTE_HOST):$(REMOTE_DIR)/
+	rsync -avz --delete --delete-after $(EXCLUDES) -e ssh ./ $(REMOTE_HOST):$(REMOTE_DIR)/
 
 vendor: sync
 	ssh $(REMOTE_HOST) "cd $(REMOTE_DIR) && ./install_vendor.sh"
