@@ -4,7 +4,6 @@ module Hilal.Edit
   , emptyForm
   , formFromMosque
   , validateForm
-  , validateNew
   , changedTimings
   , creationLog
   , editLog
@@ -17,6 +16,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime)
 
+import Hilal.Location (Place (..))
 import Hilal.Time (lookupZone)
 import Hilal.Types
   ( Coords (..)
@@ -32,11 +32,12 @@ import Hilal.Types
   , prayerToText
   )
 
+-- The name always comes from Google Maps, never from what was typed.
 data MosqueForm = MosqueForm
   { formName     :: Text
   , formAddress  :: Text
   , formTimezone :: Text
-  , formLocation :: Text -- what was pasted; only used when adding
+  , formLocation :: Text -- the place's link; only used when adding
   , formTimes    :: [(Prayer, (Text, Text))]
   }
   deriving (Show, Eq)
@@ -80,21 +81,6 @@ validateForm f
         <> lefts checked
     whenTrue cond message = if cond then Just message else Nothing
 
--- Adding also needs a location, found from what was pasted before validating.
-validateNew :: MosqueForm -> Maybe Coords -> Either [Text] (ValidMosque, Coords)
-validateNew f location =
-  case (validateForm f, location) of
-    (Right valid, Just c) -> Right (valid, c)
-    (result, _)           -> Left (either id (const []) result <> locationErrors)
-  where
-    locationErrors = case location of
-      Just _ -> []
-      Nothing
-        | T.null (T.strip (formLocation f)) ->
-            ["Please paste the mosque's Google Maps link."]
-        | otherwise ->
-            ["We couldn't find a location in that link. Try the link from Google Maps' Share button, or paste coordinates like 21.2036, 81.3700."]
-
 checkPrayer :: (Prayer, (Text, Text)) -> Either Text (Prayer, PrayerTime)
 checkPrayer (p, (azanText, jamaatText)) =
   case (parseClock (T.strip azanText), parseClock (T.strip jamaatText)) of
@@ -110,15 +96,18 @@ logLine :: UTCTime -> UserId -> MosqueId -> Text -> Text
 logLine now (UserId u) (MosqueId m) change =
   formatTimestamp now <> " user=" <> T.pack (show u) <> " mosque=" <> T.pack (show m) <> " " <> change
 
-creationLog :: ValidMosque -> Coords -> [Text]
-creationLog v (Coords lat lng) =
+creationLog :: ValidMosque -> Place -> [Text]
+creationLog v p =
   ( "created name=" <> quoted (validName v)
       <> " address=" <> quoted (validAddress v)
       <> " timezone=" <> quoted (validTimezone v)
+      <> " google_place=" <> quoted (placeId p)
       <> " lat=" <> T.pack (show lat)
       <> " lng=" <> T.pack (show lng)
   )
-    : map (\(p, t) -> prayerToText p <> ": " <> times t) (validTimings v)
+    : map (\(pr, t) -> prayerToText pr <> ": " <> times t) (validTimings v)
+  where
+    Coords lat lng = placeCoords p
 
 editLog :: Mosque -> [(Prayer, PrayerTime)] -> ValidMosque -> [Text]
 editLog m old v =

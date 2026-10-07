@@ -1,18 +1,21 @@
 module Hilal.Location
-  ( parseLocation
+  ( Place (..)
+  , parsePlace
+  , placeLink
   , shortLink
-  , locate
+  , locatePlace
+  , isMosqueName
   , newLinkResolver
   , coordsFromParams
   , distanceMeters
   ) where
 
 import Control.Exception (try)
-import Data.Char (isAlphaNum)
+import Data.Char (isAlphaNum, isHexDigit)
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
+import Data.Text.Encoding (decodeUtf8, decodeUtf8With, encodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Text.Read (rational)
 import Network.HTTP.Client
@@ -26,19 +29,37 @@ import Network.HTTP.Client
   , responseTimeoutMicro
   )
 import Network.HTTP.Client.TLS (newTlsManager)
-import Network.HTTP.Types.URI (urlDecode)
+import Network.HTTP.Types.URI (urlDecode, urlEncode)
 
 import Hilal.Types (Coords (..))
 
--- Coordinates from what someone pasted: the text Google Maps shares,
--- a full Google Maps link, or plain "21.2036, 81.3700".
--- Short links (maps.app.goo.gl) carry no coordinates; see `locate`.
-parseLocation :: Text -> Maybe Coords
-parseLocation input = case findUrl input of
-  Just url -> fromUrl (decodeUrl url)
-  Nothing -> case pair (T.strip input) of
-    Just (c, rest) | T.null (T.strip rest) -> Just c
-    _                                      -> Nothing
+-- A place on Google Maps, as its link describes it.
+data Place = Place
+  { placeId     :: Text   -- Google's id for the place, such as "0x3a28dd…:0x5d2f…"
+  , placeName   :: Text   -- as Google Maps names it
+  , placeCoords :: Coords -- the place's own pin
+  }
+  deriving (Show, Eq)
+
+-- The place in what someone pasted: the text Google Maps shares, or a full Google Maps link.
+-- A link to a map view or plain coordinates has no place, so it gives nothing.
+-- Short links (maps.app.goo.gl) have to be followed first; see `locatePlace`.
+parsePlace :: Text -> Maybe Place
+parsePlace input = do
+  url <- decodeUrl <$> findUrl input
+  name <- nameIn url
+  pid <- featureId url
+  c <- listToMaybe (mapMaybe ($ url) [pinned, viewport])
+  return (Place pid name c)
+
+-- A full link to the place, which `parsePlace` reads back without asking Google.
+-- The form carries it between its two steps.
+placeLink :: Place -> Text
+placeLink (Place pid name (Coords lat lng)) =
+  "https://www.google.com/maps/place/" <> encode name <> "/data=!1s" <> pid
+    <> "!3d" <> T.pack (show lat) <> "!4d" <> T.pack (show lng)
+  where
+    encode = decodeUtf8 . urlEncode True . encodeUtf8
 
 -- The https form of a Google Maps short link in the pasted text, if there is one.
 shortLink :: Text -> Maybe Text
@@ -51,14 +72,32 @@ shortLink input = do
   where
     safe c = isAlphaNum c || c `elem` ("-_/?=&." :: String)
 
--- Like `parseLocation`, but also follows a short link with the given resolver,
+-- Like `parsePlace`, but also follows a short link with the given resolver,
 -- which returns where the short link points.
-locate :: (Text -> IO (Maybe Text)) -> Text -> IO (Maybe Coords)
-locate resolve input = case parseLocation input of
-  Just c -> return (Just c)
+locatePlace :: (Text -> IO (Maybe Text)) -> Text -> IO (Maybe Place)
+locatePlace resolve input = case parsePlace input of
+  Just p -> return (Just p)
   Nothing -> case shortLink input of
-    Just url -> (>>= parseLocation) <$> resolve url
+    Just url -> (>>= parsePlace) <$> resolve url
     Nothing  -> return Nothing
+
+-- Whether Google Maps names the place as a mosque, in English or an Indian script.
+-- Idgahs, dargahs, madrasas and "palli", which Kerala also uses for churches, are left out on purpose.
+isMosqueName :: Text -> Bool
+isMosqueName name = any (`T.isInfixOf` T.toLower name) mosqueWords
+
+mosqueWords :: [Text]
+mosqueWords =
+  [ "masjid", "masjeed", "masjed", "musjid", "mosque"
+  , "मस्जिद"        -- Hindi
+  , "مسجد"          -- Urdu
+  , "মসজিদ"         -- Bengali
+  , "మసీదు"          -- Telugu
+  , "பள்ளிவாசல்"     -- Tamil
+  , "മസ്ജിദ്"        -- Malayalam
+  , "ಮಸೀದಿ"          -- Kannada
+  , "મસ્જિદ"         -- Gujarati
+  ]
 
 -- A resolver that asks Google where a short link points, without following it further.
 -- Only called with links that `shortLink` produced, so it only ever contacts maps.app.goo.gl.
@@ -105,19 +144,36 @@ findUrl = listToMaybe . filter isUrl . T.words
 decodeUrl :: Text -> Text
 decodeUrl = decodeUtf8With lenientDecode . urlDecode True . encodeUtf8
 
--- In order of preference: the place's own pin, the map's centre, a query.
-fromUrl :: Text -> Maybe Coords
-fromUrl url = listToMaybe (mapMaybe ($ url) [pinned, viewport, queried])
+-- The name in ".../maps/place/Jama Masjid/...".
+nameIn :: Text -> Maybe Text
+nameIn url = do
+  rest <- after "/maps/place/" url
+  let name = T.strip (T.takeWhile (/= '/') rest)
+  if T.null name then Nothing else Just name
+
+-- Google's id for the place: two hexadecimal numbers, "0x…:0x…".
+featureId :: Text -> Maybe Text
+featureId url = listToMaybe (mapMaybe (fromMatch . snd) (T.breakOnAll "0x" url))
   where
-    pinned t = do
-      rest <- after "!3d" t
-      (la, r) <- number rest
-      r' <- T.stripPrefix "!4d" r
-      (lo, _) <- number r'
-      coords la lo
-    viewport t = fst <$> (pair =<< after "/@" t)
-    queried t =
-      listToMaybe (mapMaybe (\key -> fst <$> (pair =<< after key t)) ["q=", "query=", "ll=", "center=", "destination="])
+    fromMatch t = do
+      (a, r) <- hex =<< T.stripPrefix "0x" t
+      (b, _) <- hex =<< T.stripPrefix ":0x" r
+      return (T.toLower ("0x" <> a <> ":0x" <> b))
+    hex t = case T.span isHexDigit t of
+      (h, r) | not (T.null h) -> Just (h, r)
+      _                       -> Nothing
+
+-- The place's own pin, preferred to the map's centre.
+pinned :: Text -> Maybe Coords
+pinned t = do
+  rest <- after "!3d" t
+  (la, r) <- number rest
+  r' <- T.stripPrefix "!4d" r
+  (lo, _) <- number r'
+  coords la lo
+
+viewport :: Text -> Maybe Coords
+viewport t = fst <$> (pair =<< after "/@" t)
 
 after :: Text -> Text -> Maybe Text
 after key t = case T.breakOn key t of

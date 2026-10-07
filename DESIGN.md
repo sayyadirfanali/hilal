@@ -15,7 +15,7 @@ Anyone can browse mosques and timings without signing in.
 Signing in is required to add a mosque, edit a mosque, or follow one.
 Every signed-in user can add and edit any mosque; there are no mosque admins.
 Mosque admins may be added later, only if the community model stops working at scale.
-The superadmin, the project owner, moderates by deleting duplicates, reverting vandalism, and blocking users, all via SQL for now.
+The superadmin, the project owner, moderates by reverting vandalism and blocking users, all via SQL for now; duplicates can't be added.
 The superadmin is identified by a hardcoded email address in `app/Main.hs`.
 A blocked user cannot sign in, their existing sessions stop working immediately, and the same email cannot sign up again, because the user row is kept.
 A code sent before the user was blocked is refused too.
@@ -53,25 +53,36 @@ Cookies are `HttpOnly` and `SameSite=Lax`, and `Secure` when `HILAL_ENV=producti
 Every POST route checks that the `Origin` header, when present, matches the `Host` header, as protection against cross-site requests.
 
 ## Mosques
-Adding a mosque requires its location, a name, an address in the form "locality, city", a time zone, and all six timings.
+A mosque is added from its Google Maps link, because Google Maps already lists almost every mosque, and sharing a link is something everyone knows how to do; nobody in India types latitude and longitude.
+Adding has two steps: first the link, then a form with the name filled in, for the address in the form "locality, city", the time zone, and all six timings.
 Requiring all six means every mosque is listed and followable from the moment it is added.
 The time zone is preselected from the phone's own setting with a few lines of JavaScript, falling back to `Asia/Kolkata`.
-Duplicates are tolerated; the superadmin deletes them.
-Editing uses the same form as adding, prefilled, but without the location.
+Both steps work without JavaScript.
 
-The location comes from Google Maps, which already lists almost every mosque: people share or copy the mosque's link from Google Maps and paste it.
-The field also accepts the whole text Google Maps shares, a full Google Maps link, or plain coordinates such as "21.2036, 81.3700".
-Short links (`maps.app.goo.gl`) carry no coordinates, so the server asks Google where they point, without following the link further, and reads the coordinates from that address.
+From the link, Hilal takes the place's name, its pin, and Google's id for the place; a link carries nothing else, so the address is typed.
+The field accepts the whole text Google Maps shares or a full Google Maps link; a link to a map view, or plain coordinates, has no place in it and is refused.
+Short links (`maps.app.goo.gl`) carry nothing themselves, so the server asks Google where they point, without following the link further, and reads that address.
 Only `maps.app.goo.gl` is ever contacted, so the field can't be used to make the server fetch other addresses.
-Google may change its links at any time; plain coordinates always work, because Google Maps shows them for any spot that's long-pressed.
-A mosque missing from Google Maps should be added there first; tutorials for that will come later.
-Only coordinates are taken from Google, never names, photos, or other data, and no Google library or API key is used.
+The second step carries the place as a link Hilal makes itself, and saving reads and checks it again.
+No Google library or API key is used, and nothing else, such as photos or reviews, is taken from Google.
+Google may change its links at any time; then nothing can be added until Hilal reads the new form.
+A mosque missing from Google Maps must be added there first; tutorials for that will come later.
 
-A mosque's location never changes, because mosques are rebuilt where they stand, not moved; so the edit form has no location, and the superadmin corrects mistakes with SQL.
-The address is typed by hand; nothing looks it up.
+Against vandalism, such as temples added to mess with Hilal, only places Google Maps names as a mosque can be added.
+The name must contain masjid, masjeed, masjed, musjid or mosque, in any case, or "mosque" in an Indian script (Hindi, Urdu, Bengali, Telugu, Tamil, Malayalam, Kannada, Gujarati).
+Idgahs, dargahs, madrasas and "palli", which Kerala also uses for churches, are left out on purpose.
+This works because the name comes from Google, and renaming a place on Google Maps needs an edit Google reviews.
+A real mosque whose Google name lacks these words is refused, with a suggestion to correct its name on Google Maps.
+Someone determined could still hand-make a fake Google link; the check stops mistakes and casual vandalism, not fraud, which stays the superadmin's job.
+
+A place can be added only once: Google's id for it is stored, unique, and adding it again points to the mosque already there.
+The name is always Google's, never typed, and can't be changed by editing, so a mosque can't be renamed into something else.
+A mosque's location never changes either, because mosques are rebuilt where they stand, not moved.
+Editing uses the same form as adding, prefilled, but without the link; it changes only the address, time zone, and timings.
+The superadmin corrects a wrong name or location with SQL.
 There are no photos in v0: Google's photos aren't ours to use, and uploads would need moderation and could show people's faces.
 
-Every addition and change is appended to `edits.log`, one line per change, with the time, user id, and mosque id, but no email.
+Every addition and change is appended to `edits.log`, one line per change, with the time, user id, and mosque id, but no email; an addition also records Google's id for the place.
 The log is plain text on purpose, so it can be searched with `grep`; it is not stored in SQL.
 
 ## Timings model
@@ -204,7 +215,7 @@ Every connection enables foreign keys, WAL mode, and a busy timeout.
 Settings that differ between development, tests, and production live in a `Config` value passed to `app`.
 
 Until launch, the schema lives in `schema.sql`, using `CREATE TABLE IF NOT EXISTS`, and runs at every startup.
-After any schema change, delete hilal.db and let it be recreated; `seed_db.sh` does this and loads test data.
+After any schema change, delete hilal.db and let it be recreated empty; mosques are then added through Hilal itself, as on the server.
 At launch, schema.sql becomes the first numbered migration, and every later change is a new append-only migration tracked with PRAGMA user_version.
 Never edit a migration after it has been deployed.
 
@@ -216,7 +227,7 @@ Modules:
 - `Hilal.Query`: all SQL queries.
 - `Hilal.Time`: time zones and next-prayer logic.
 - `Hilal.Hijri`: Hijri dates, from the generated table in `Hilal.HijriTable`.
-- `Hilal.Location`: reading coordinates from pasted links, following short links, and distances.
+- `Hilal.Location`: reading places from Google Maps links, following short links, checking that a place is named as a mosque, and distances.
 - `Hilal.Auth`: codes, tokens, hashing, cookies, sign-in limits, and request checks.
 - `Hilal.Edit`: the mosque form, its validation, and edit-log lines.
 - `Hilal.Email`: sending sign-in codes through Brevo.
@@ -232,33 +243,34 @@ Keeping it to a folder, one program, one SQLite file, systemd, and Nginx means t
 
 `make deploy` does everything from the development machine, over SSH:
 
-1. rsync copies the folder to the server, skipping `.git/` and everything `.gitignore` lists, with `--delete`;
+1. rsync copies the folder to the server, skipping `.git/` and everything `.gitignore` lists except `hilal.env`, with `--delete --delete-after`;
 2. the server builds Hilal with ghcup, so it links against Fedora's own libraries, and installs the program as `hilal` in the folder;
 3. it copies `deploy/hilal.service` to `/etc/systemd/system/` and restarts Hilal.
 
 Each step runs only if the one before succeeded, so a failed build never replaces the running program.
 Replacing the program file doesn't stop the running one; the restart switches to it.
+`--delete-after` deletes only once the new `.gitignore` has arrived, because the server decides what to delete from its own copy; deleting earlier removed `hilal.env` the first time it was added to `.gitignore`.
 `make vendor` downloads Tailwind, daisyUI, MapLibre and the fonts on the server, once and whenever `install_vendor.sh` changes, because they are built for each machine.
 `make status` and `make log` show the service's state and output.
-The server's SSH host and folder are in `config.mk`, which git ignores.
+The server's SSH host and folder are in `config.mk`, which git ignores, because the repository is public.
 
-What exists only on the server is listed in `.gitignore`, so rsync neither sends it nor deletes it: the built `hilal`, `hilal.db` and `edits.log`, the downloaded `vendor/`, and `hilal.env`.
-The local test database is never copied over by a deploy; when that is wanted before launch, it is copied by hand with Hilal stopped.
-Hilal never seeds its database; `seed_db.sh` is for the development machine only.
+What exists only on the server is listed in `.gitignore`, so rsync neither sends it nor deletes it: the built `hilal`, `hilal.db` and `edits.log`, and the downloaded `vendor/`.
+The local database is never copied over by a deploy.
+Hilal never seeds its database, on the server or locally.
 Until launch, a schema change means deleting `hilal.db` on the server too, losing its data.
 
 `deploy/` holds the two files the server needs:
 
-- `hilal.service`, the systemd unit, which runs `hilal` from the folder, sets `HILAL_ENV=production`, reads `hilal.env`, restarts Hilal if it stops, and lets it write only its own folder;
+- `hilal.service`, the systemd unit, which runs `hilal` from the folder, reads `hilal.env`, restarts Hilal if it stops, and lets it write only its own folder;
 - `hilal.nginx.conf`, installed once by hand as `/etc/nginx/conf.d/hilal.conf`, because certbot then adds HTTPS to the installed copy, and copying it again would remove that.
 
 Hilal reads these environment variables:
 
-- `HILAL_ENV=production`, set in the unit, makes cookies `Secure` and makes Hilal refuse to start with a demo code or without the two below;
-- `BREVO_API_KEY` and `HILAL_MAIL_FROM`, in `hilal.env`, send sign-in codes by email;
+- `HILAL_ENV=production` makes cookies `Secure` and makes Hilal refuse to start with a demo code or without the two below;
+- `BREVO_API_KEY` and `HILAL_MAIL_FROM` send sign-in codes by email;
 - `HILAL_DEMO_CODE`, never set on the server, makes every code that value, for offline demos.
 
-`hilal.env` is created by hand on the server, readable only by its owner, and is never synced or committed.
+The first three are in `hilal.env`, readable only by its owner, kept on the development machine and sent by `make deploy`, and never committed.
 Without these variables, as when running locally with `cabal run`, codes are printed to the terminal instead.
 
 Nginx terminates HTTPS, with a certificate from Let's Encrypt through certbot, and compresses responses; Hilal itself speaks plain HTTP on port 8080.

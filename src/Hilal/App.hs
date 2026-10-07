@@ -52,10 +52,9 @@ import Hilal.Edit
   , formFromMosque
   , logLine
   , validateForm
-  , validateNew
   )
 import Hilal.JSON (followedJson, notFoundJson, notSignedInJson, timingsJson)
-import Hilal.Location (coordsFromParams, distanceMeters, locate)
+import Hilal.Location (Place (..), coordsFromParams, distanceMeters, isMosqueName, locatePlace, placeLink)
 import Hilal.Query
   ( clearWrongCodes
   , countSentCodes
@@ -76,6 +75,7 @@ import Hilal.Query
   , isFollowing
   , killSession
   , makeSession
+  , mosqueByPlace
   , recordSentCode
   , recordWrongCode
   , saveSignInCode
@@ -89,6 +89,7 @@ import Hilal.Types (Mosque (..), MosqueId (..), Prayer, PrayerTime, User (..), h
 import Hilal.Views
   ( FollowState (..)
   , accountPage
+  , addLinkPage
   , codePage
   , homePage
   , mosqueFormPage
@@ -166,26 +167,46 @@ app cfg = scottyApp $ do
               searchMosques conn (Just (pageSize + 1)) q
             page (mosquesPage q Nothing (map (\m -> (m, Nothing)) (take pageSize found)) (length found > pageSize))
 
+  -- Adding has two steps: the Google Maps link, then the rest of the form,
+  -- with the name and location taken from the link.
   get "/mosques/new" $
     requireUser dbPath "/mosques/new" $ \_ ->
-      page (mosqueFormPage "Add a mosque" "/mosques/new" [] emptyForm [] True)
+      page (addLinkPage "" [] Nothing)
 
+  post "/mosques/new/link" $ sameOriginOnly $
+    requireUser dbPath "/mosques/new" $ \_ -> do
+      pasted <- textParam "location"
+      checked <- checkPlace dbPath (configResolveLink cfg) pasted
+      case checked of
+        Left refusal -> do
+          status status400
+          page refusal
+        Right place ->
+          page (mosqueFormPage "Add a mosque" "/mosques/new" [] (placeForm place emptyForm) [] True)
+
+  -- The link is read and checked again, so the name and location can't be swapped on the way.
   post "/mosques/new" $ sameOriginOnly $
     requireUser dbPath "/mosques/new" $ \user -> do
-      form <- readMosqueForm
-      location <- liftIO (locate (configResolveLink cfg) (formLocation form))
-      case validateNew form location of
-        Left errors -> do
+      submitted <- readMosqueForm
+      checked <- checkPlace dbPath (configResolveLink cfg) (formLocation submitted)
+      case checked of
+        Left refusal -> do
           status status400
-          page (mosqueFormPage "Add a mosque" "/mosques/new" errors form [] True)
-        Right (valid, coords) -> do
-          now <- liftIO getCurrentTime
-          mid <- liftIO $ withDb dbPath $ \conn -> withTransaction conn $ do
-            newId <- createMosque conn (validName valid) (validAddress valid) (validTimezone valid) coords
-            forM_ (validTimings valid) $ uncurry (saveTiming conn now newId)
-            return newId
-          liftIO $ mapM_ (configLogEdit cfg . logLine now (userId user) mid) (creationLog valid coords)
-          redirect (TL.fromStrict (mosqueUrl mid))
+          page refusal
+        Right place -> do
+          let form = placeForm place submitted
+          case validateForm form of
+            Left errors -> do
+              status status400
+              page (mosqueFormPage "Add a mosque" "/mosques/new" errors form [] True)
+            Right valid -> do
+              now <- liftIO getCurrentTime
+              mid <- liftIO $ withDb dbPath $ \conn -> withTransaction conn $ do
+                newId <- createMosque conn (validName valid) (validAddress valid) (validTimezone valid) (placeId place) (placeCoords place)
+                forM_ (validTimings valid) $ uncurry (saveTiming conn now newId)
+                return newId
+              liftIO $ mapM_ (configLogEdit cfg . logLine now (userId user) mid) (creationLog valid place)
+              redirect (TL.fromStrict (mosqueUrl mid))
 
   get "/mosques/:id" $ do
     found <- loadMosque dbPath =<< pathParam "id"
@@ -227,7 +248,8 @@ app cfg = scottyApp $ do
       Nothing -> notFoundResponse
       Just (m, oldTimings, _) ->
         requireUser dbPath (editUrl m) $ \user -> do
-          form <- readMosqueForm
+          -- The name stays as Google Maps had it when the mosque was added.
+          form <- (\f -> f { formName = mosqueName m }) <$> readMosqueForm
           case validateForm form of
             Left errors -> do
               upcoming <- upcomingFor m oldTimings
@@ -380,6 +402,32 @@ app cfg = scottyApp $ do
 
 tooManyWrongCodes :: Text
 tooManyWrongCodes = "Too many wrong codes for this email today. Please try again tomorrow."
+
+-- A link to a place Google Maps names as a mosque, which isn't on Hilal yet;
+-- otherwise the first step's page, saying why not.
+checkPlace :: FilePath -> (Text -> IO (Maybe Text)) -> Text -> ActionM (Either (Html ()) Place)
+checkPlace dbPath resolve pasted = do
+  found <- liftIO (locatePlace resolve pasted)
+  case found of
+    Nothing ->
+      return (Left (addLinkPage pasted [noPlace] Nothing))
+    Just place
+      | not (isMosqueName (placeName place)) ->
+          return (Left (addLinkPage pasted [notMosque] Nothing))
+      | otherwise -> do
+          existing <- liftIO $ withDb dbPath $ \conn -> mosqueByPlace conn (placeId place)
+          return $ case existing of
+            Just mid -> Left (addLinkPage pasted [] (Just mid))
+            Nothing  -> Right place
+  where
+    noPlace =
+      "We couldn't find a place in that link. In Google Maps, open the mosque itself, tap Share, and paste that link."
+    notMosque =
+      "Hilal only adds places that Google Maps names as a mosque. If this is a mosque, suggest an edit to its name on Google Maps so it includes \"Masjid\", then add it again."
+
+-- The form with the name and the link from Google Maps, whatever was submitted for them.
+placeForm :: Place -> MosqueForm -> MosqueForm
+placeForm place f = f { formName = placeName place, formLocation = placeLink place }
 
 changeFollow :: FilePath -> FollowAction -> Text -> ActionM ()
 changeFollow dbPath action idText = do

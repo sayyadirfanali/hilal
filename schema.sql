@@ -1,10 +1,11 @@
 CREATE TABLE IF NOT EXISTS mosques (
-  id        INTEGER PRIMARY KEY,
-  name      TEXT NOT NULL,
-  address   TEXT NOT NULL,
-  lat       REAL NOT NULL, -- degrees north
-  lng       REAL NOT NULL, -- degrees east
-  timezone  TEXT NOT NULL  -- 'Asia/Kolkata'
+  id            INTEGER PRIMARY KEY,
+  name          TEXT NOT NULL, -- as Google Maps names it
+  address       TEXT NOT NULL,
+  lat           REAL NOT NULL, -- degrees north
+  lng           REAL NOT NULL, -- degrees east
+  timezone      TEXT NOT NULL, -- 'Asia/Kolkata'
+  google_place  TEXT UNIQUE    -- Google's id for the place, '0x…:0x…'; empty only for test data
 );
 
 CREATE TABLE IF NOT EXISTS timings (

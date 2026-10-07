@@ -5,6 +5,7 @@ module Hilal.Query
   , searchMosques
   , getLastUpdated
   , createMosque
+  , mosqueByPlace
   , updateMosque
   , saveSignInCode
   , getSignInCode
@@ -93,12 +94,21 @@ getLastUpdated conn mid = do
     [Only (Just t)] -> parseTimestamp t
     _               -> Nothing
 
-createMosque :: Connection -> Text -> Text -> Text -> Coords -> IO MosqueId
-createMosque conn name address timezone (Coords lat lng) = do
+-- Fails if a mosque with the same Google Maps place already exists.
+createMosque :: Connection -> Text -> Text -> Text -> Text -> Coords -> IO MosqueId
+createMosque conn name address timezone place (Coords lat lng) = do
   execute conn
-    "INSERT INTO mosques (name, address, lat, lng, timezone) VALUES (?, ?, ?, ?, ?)"
-    (name, address, lat, lng, timezone)
+    "INSERT INTO mosques (name, address, lat, lng, timezone, google_place) VALUES (?, ?, ?, ?, ?, ?)"
+    (name, address, lat, lng, timezone, place)
   MosqueId <$> lastInsertRowId conn
+
+-- The mosque already added for this Google Maps place, if any.
+mosqueByPlace :: Connection -> Text -> IO (Maybe MosqueId)
+mosqueByPlace conn place = do
+  rows <- query conn "SELECT id FROM mosques WHERE google_place = ?" (Only place)
+  return $ case rows of
+    [Only mid] -> Just mid
+    _          -> Nothing
 
 updateMosque :: Connection -> MosqueId -> Text -> Text -> Text -> IO ()
 updateMosque conn mid name address timezone =

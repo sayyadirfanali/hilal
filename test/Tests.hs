@@ -19,7 +19,7 @@ import Data.Time (Day, LocalTime (..), TimeOfDay (..), UTCTime (..), addUTCTime,
 import Data.Time.Zones (utcToLocalTimeTZ)
 import Database.SQLite.Simple (Connection, Only (..), execute, execute_, query_)
 import Lucid (renderText)
-import Network.HTTP.Types (Header)
+import Network.HTTP.Types (Header, statusCode, urlEncode)
 import Network.Wai (Application)
 import System.IO.Temp (emptySystemTempFile)
 import Test.Hspec
@@ -41,10 +41,10 @@ import Hilal.Auth
   , sha256
   )
 import Hilal.DB (withDb)
-import Hilal.Edit (MosqueForm (..), ValidMosque (..), changedTimings, editLog, emptyForm, validateForm, validateNew)
+import Hilal.Edit (MosqueForm (..), ValidMosque (..), changedTimings, editLog, emptyForm, validateForm)
 import Hilal.Hijri (HijriDate (..), HijriPart (..), hijriFromDay, hijriParts)
 import Hilal.JSON (followedJson, timingsJson)
-import Hilal.Location (distanceMeters, locate, parseLocation, shortLink)
+import Hilal.Location (Place (..), distanceMeters, isMosqueName, locatePlace, parsePlace, placeLink, shortLink)
 import Hilal.Migrate (migrate)
 import Hilal.Query
   ( clearWrongCodes
@@ -66,6 +66,7 @@ import Hilal.Query
   , isFollowing
   , killSession
   , makeSession
+  , mosqueByPlace
   , recordSentCode
   , recordWrongCode
   , saveSignInCode
@@ -146,14 +147,24 @@ authAppWith change = do
     }
   return (TestState path codes logs, application)
 
+-- A mosque on Google Maps, and the link Hilal makes for it.
+noorPlace :: Place
+noorPlace = Place "0x3a28dd1b2c3d4e5f:0xa1b2c3d4e5f60718" "Noor Masjid" (Coords 21.2101 81.3502)
+
+noorLink :: Text
+noorLink = placeLink noorPlace
+
 -- A short link that the test resolver below knows, and where it points.
 shortNoorLink :: Text
 shortNoorLink = "https://maps.app.goo.gl/noor"
 
 resolveTestLink :: Text -> IO (Maybe Text)
 resolveTestLink url
-  | url == shortNoorLink = return (Just "https://www.google.com/maps/place/Noor+Masjid/@21.2101,81.3502,17z")
+  | url == shortNoorLink = return (Just noorLink)
   | otherwise            = return Nothing
+
+formValue :: Text -> BL.ByteString
+formValue = BL.fromStrict . urlEncode True . encodeUtf8
 
 bodyOf :: ByteString -> WaiSession st ByteString
 bodyOf path = BL.toStrict . simpleBody <$> get path
@@ -192,19 +203,23 @@ homeBody cookie = do
   response <- request "GET" "/" [("Cookie", cookie)] ""
   return (BL.toStrict (simpleBody response))
 
+-- The second step of adding Noor Masjid; the name comes from the link.
 newMosqueBody :: BL.ByteString
 newMosqueBody =
-  "name=Noor+Masjid&address=Supela%2C+Bhilai&timezone=Asia%2FKolkata&location=21.2101%2C81.3502\
-  \&fajr_azan=05:00&fajr_jamaat=05:15&zuhr_azan=13:00&zuhr_jamaat=13:15\
-  \&asr_azan=16:30&asr_jamaat=16:45&maghrib_azan=18:00&maghrib_jamaat=18:05\
-  \&isha_azan=19:30&isha_jamaat=19:45&jumuah_azan=13:00&jumuah_jamaat=13:30"
+  "address=Supela%2C+Bhilai&timezone=Asia%2FKolkata&location=" <> formValue noorLink
+    <> "&fajr_azan=05:00&fajr_jamaat=05:15&zuhr_azan=13:00&zuhr_jamaat=13:15\
+       \&asr_azan=16:30&asr_jamaat=16:45&maghrib_azan=18:00&maghrib_jamaat=18:05\
+       \&isha_azan=19:30&isha_jamaat=19:45&jumuah_azan=13:00&jumuah_jamaat=13:30"
 
-editMosqueBody :: BL.ByteString
-editMosqueBody =
-  "name=Sultan+Ahmed+Mosque&address=Sultanahmet%2C+Istanbul&timezone=Europe%2FIstanbul\
+editTimingsBody :: BL.ByteString
+editTimingsBody =
+  "address=Sultanahmet%2C+Istanbul&timezone=Europe%2FIstanbul\
   \&fajr_azan=05:00&fajr_jamaat=05:15&zuhr_azan=13:00&zuhr_jamaat=13:15\
   \&asr_azan=16:00&asr_jamaat=16:30&maghrib_azan=18:00&maghrib_jamaat=18:15\
   \&isha_azan=20:00&isha_jamaat=20:15&jumuah_azan=13:00&jumuah_jamaat=13:15"
+
+editMosqueBody :: BL.ByteString
+editMosqueBody = "name=Sultan+Ahmed+Mosque&" <> editTimingsBody
 
 jamaMasjid :: Mosque
 jamaMasjid = Mosque {
@@ -377,50 +392,53 @@ main = hspec $ do
     it "starts adding with every prayer blank" $
       validateForm emptyForm `shouldSatisfy` isLeft
 
-  describe "validateNew" $ do
-    it "accepts a complete form with a location" $
-      validateNew validForm (Just (Coords 21.2101 81.3502))
-        `shouldBe` Right (ValidMosque "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" allSix, Coords 21.2101 81.3502)
+  describe "parsePlace" $ do
+    let jama = Place "0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88" "Jama Masjid" (Coords 21.2036 81.37)
 
-    it "requires a location" $
-      validateNew validForm Nothing `shouldSatisfy` isLeft
+    it "reads the name, Google's id and the pin from a place link" $
+      parsePlace "https://www.google.com/maps/place/Jama+Masjid/@21.2030,81.3690,17z/data=!3m1!4b1!4m6!3m5!1s0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88!8m2!3d21.2036!4d81.37!16s%2Fg%2F11b6"
+        `shouldBe` Just jama
 
-    it "reports the location and the form's own errors together" $
-      fmap length (either Just (const Nothing) (validateNew validForm { formName = "" } Nothing))
-        `shouldBe` Just 2
-
-  describe "parseLocation" $ do
-    it "prefers the place's pin to the map's centre" $
-      parseLocation "https://www.google.com/maps/place/Jama+Masjid/@21.2030,81.3690,17z/data=!3m1!4b1!4m6!3m5!8m2!3d21.2036!4d81.37!16s"
-        `shouldBe` Just (Coords 21.2036 81.37)
-
-    it "reads the map's centre" $
-      parseLocation "https://www.google.com/maps/@21.2036,81.37,15z"
-        `shouldBe` Just (Coords 21.2036 81.37)
-
-    it "reads coordinates in a query" $
-      parseLocation "https://maps.google.com/?q=21.2036,81.37"
-        `shouldBe` Just (Coords 21.2036 81.37)
-
-    it "reads plain coordinates" $
-      parseLocation " 21.2036, 81.37 " `shouldBe` Just (Coords 21.2036 81.37)
+    it "uses the map's centre when the link has no pin" $
+      parsePlace "https://www.google.com/maps/place/Jama+Masjid/@21.2036,81.37,17z/data=!1s0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88"
+        `shouldBe` Just jama
 
     it "finds the link in the text Google Maps shares" $
-      parseLocation "Jama Masjid\nhttps://www.google.com/maps/@21.2036,81.37,15z"
-        `shouldBe` Just (Coords 21.2036 81.37)
+      parsePlace ("Jama Masjid\n" <> placeLink jama) `shouldBe` Just jama
 
     it "reads a link wrapped in Google's consent page" $
-      parseLocation "https://consent.google.com/m?continue=https://www.google.com/maps/place/X/%4021.2036,81.37,17z"
-        `shouldBe` Just (Coords 21.2036 81.37)
+      parsePlace "https://consent.google.com/m?continue=https://www.google.com/maps/place/Jama+Masjid/data%3D!1s0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88!3d21.2036!4d81.37"
+        `shouldBe` Just jama
 
-    it "finds nothing in a query by name" $
-      parseLocation "https://maps.google.com/?q=Jama+Masjid" `shouldBe` Nothing
+    it "finds nothing in a link to a map view, which has no place" $
+      parsePlace "https://www.google.com/maps/@21.2036,81.37,15z" `shouldBe` Nothing
+
+    it "finds nothing without Google's id for the place" $
+      parsePlace "https://www.google.com/maps/place/Jama+Masjid/@21.2036,81.37,17z" `shouldBe` Nothing
+
+    it "finds nothing in plain coordinates" $
+      parsePlace "21.2036, 81.37" `shouldBe` Nothing
 
     it "rejects coordinates out of range" $
-      parseLocation "https://www.google.com/maps/@95.0,81.37,15z" `shouldBe` Nothing
+      parsePlace "https://www.google.com/maps/place/Jama+Masjid/data=!1s0x1:0x2!3d95.0!4d81.37" `shouldBe` Nothing
 
     it "finds nothing in a short link, which has to be followed first" $
-      parseLocation "https://maps.app.goo.gl/abc123" `shouldBe` Nothing
+      parsePlace "https://maps.app.goo.gl/abc123" `shouldBe` Nothing
+
+    it "reads back the link Hilal makes" $
+      parsePlace (placeLink noorPlace) `shouldBe` Just noorPlace
+
+  describe "isMosqueName" $ do
+    it "accepts the common English spellings, in any case" $
+      map isMosqueName ["Jama Masjid", "Sultan Ahmed Mosque", "MASJID-E-NOOR", "Makka Musjid", "Masjeed Al-Huda"]
+        `shouldBe` [True, True, True, True, True]
+
+    it "accepts names in Indian scripts" $
+      map isMosqueName ["जामा मस्जिद", "مسجد نور"] `shouldBe` [True, True]
+
+    it "refuses other places" $
+      map isMosqueName ["Shri Ram Mandir", "Haji Ali Dargah", "Eidgah Maidan", "St. Mary's Palli"]
+        `shouldBe` [False, False, False, False]
 
   describe "shortLink" $ do
     it "finds a short link in shared text, as https" $
@@ -429,16 +447,15 @@ main = hspec $ do
     it "ignores links to other sites" $
       shortLink "https://example.com/abc123" `shouldBe` Nothing
 
-  describe "locate" $ do
+  describe "locatePlace" $ do
     it "follows a short link" $
-      locate resolveTestLink shortNoorLink `shouldReturn` Just (Coords 21.2101 81.3502)
+      locatePlace resolveTestLink shortNoorLink `shouldReturn` Just noorPlace
 
     it "doesn't need the resolver for a full link" $
-      locate (\_ -> error "should not be called") "https://www.google.com/maps/@21.2036,81.37,15z"
-        `shouldReturn` Just (Coords 21.2036 81.37)
+      locatePlace (\_ -> error "should not be called") noorLink `shouldReturn` Just noorPlace
 
     it "is nothing when the short link can't be followed" $
-      locate (\_ -> return Nothing) shortNoorLink `shouldReturn` Nothing
+      locatePlace (\_ -> return Nothing) shortNoorLink `shouldReturn` Nothing
 
   describe "distanceMeters" $
     it "measures one degree of latitude as about 111 km" $
@@ -659,9 +676,13 @@ main = hspec $ do
       renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing)
         `shouldSatisfy` (not . TL.isInfixOf "<script")
 
-    it "escapes values typed into the mosque form" $
+    it "escapes values in the mosque form" $
       renderText (mosqueFormPage "Add a mosque" "/mosques/new" [] emptyForm { formName = "<b>x</b>" } [] False)
         `shouldSatisfy` (not . TL.isInfixOf "<b>x</b>")
+
+    it "shows the name in the mosque form without a field to change it" $
+      renderText (mosqueFormPage "Add a mosque" "/mosques/new" [] emptyForm { formName = "Noor Masjid" } [] True)
+        `shouldSatisfy` (\html -> TL.isInfixOf "Noor Masjid" html && not (TL.isInfixOf "name=\"name\"" html))
 
     it "offers to follow a listed mosque" $
       renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just NotFollowing))
@@ -712,12 +733,28 @@ main = hspec $ do
       withTestDb $ \conn ->
         getMosque conn (MosqueId 99) `shouldReturn` Nothing
 
-  describe "createMosque" $
+  describe "createMosque" $ do
     it "adds a mosque with its coordinates" $
       withTestDb $ \conn -> do
-        mid <- createMosque conn "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" (Coords 21.2101 81.3502)
+        mid <- createMosque conn "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" "0x1:0x2" (Coords 21.2101 81.3502)
         getMosque conn mid
           `shouldReturn` Just (Mosque mid "Noor Masjid" "Supela, Bhilai" 21.2101 81.3502 "Asia/Kolkata")
+
+    it "refuses a second mosque for the same Google Maps place" $
+      withTestDb $ \conn -> do
+        _ <- createMosque conn "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" "0x1:0x2" (Coords 21.2101 81.3502)
+        createMosque conn "Noor Masjid" "Elsewhere, Bhilai" "Asia/Kolkata" "0x1:0x2" (Coords 21.2101 81.3502)
+          `shouldThrow` anyException
+
+  describe "mosqueByPlace" $ do
+    it "finds the mosque added for a place" $
+      withTestDb $ \conn -> do
+        mid <- createMosque conn "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" "0x1:0x2" (Coords 21.2101 81.3502)
+        mosqueByPlace conn "0x1:0x2" `shouldReturn` Just mid
+
+    it "is nothing for a place not on Hilal" $
+      withTestDb $ \conn ->
+        mosqueByPlace conn "0x1:0x2" `shouldReturn` Nothing
 
   describe "updateMosque" $
     it "changes the details but keeps the coordinates" $
@@ -1192,9 +1229,27 @@ main = hspec $ do
         get "/mosques/new" `shouldRespondWith` 302
           { matchHeaders = ["Location" <:> "/sign-in?next=%2Fmosques%2Fnew"] }
 
-      it "shows the form when signed in" $ do
+      it "starts with the Google Maps link when signed in" $ do
         cookie <- signIn
         request "GET" "/mosques/new" [("Cookie", cookie)] "" `shouldRespondWith` 200
+
+      it "fills in the name from the link" $ do
+        cookie <- signIn
+        response <- postForm "/mosques/new/link" [("Cookie", cookie)] ("location=" <> formValue noorLink)
+        liftIO $ do
+          statusCode (simpleStatus response) `shouldBe` 200
+          BL.toStrict (simpleBody response) `shouldSatisfy` BS.isInfixOf "Noor Masjid"
+
+      it "refuses a link without a place" $ do
+        cookie <- signIn
+        postForm "/mosques/new/link" [("Cookie", cookie)] "location=21.2101%2C81.3502"
+          `shouldRespondWith` 400
+
+      it "refuses a place Google Maps doesn't name as a mosque" $ do
+        cookie <- signIn
+        let temple = placeLink noorPlace { placeName = "Shri Ram Mandir" }
+        postForm "/mosques/new/link" [("Cookie", cookie)] ("location=" <> formValue temple)
+          `shouldRespondWith` 400
 
       it "creates the mosque and logs it" $ do
         cookie <- signIn
@@ -1202,6 +1257,28 @@ main = hspec $ do
           `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/5"] }
         logLines <- readLog
         liftIO (logLines `shouldSatisfy` any (T.isInfixOf "created"))
+
+      it "takes the name from Google Maps, not from the form" $ do
+        cookie <- signIn
+        postForm "/mosques/new" [("Cookie", cookie)] (newMosqueBody <> "&name=Shri+Ram+Mandir")
+          `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/5"] }
+        logLines <- readLog
+        liftIO $ do
+          logLines `shouldSatisfy` any (T.isInfixOf "name=\"Noor Masjid\"")
+          logLines `shouldSatisfy` (not . any (T.isInfixOf "Mandir"))
+
+      it "refuses a mosque that's already on Hilal, pointing to it" $ do
+        cookie <- signIn
+        postForm "/mosques/new" [("Cookie", cookie)] newMosqueBody `shouldRespondWith` 302
+        response <- postForm "/mosques/new/link" [("Cookie", cookie)] ("location=" <> formValue noorLink)
+        liftIO $ do
+          statusCode (simpleStatus response) `shouldBe` 400
+          BL.toStrict (simpleBody response) `shouldSatisfy` BS.isInfixOf "/mosques/5"
+
+      it "refuses to save the same mosque twice" $ do
+        cookie <- signIn
+        postForm "/mosques/new" [("Cookie", cookie)] newMosqueBody `shouldRespondWith` 302
+        postForm "/mosques/new" [("Cookie", cookie)] newMosqueBody `shouldRespondWith` 400
 
       it "refuses a mosque without a location" $ do
         cookie <- signIn
@@ -1212,7 +1289,8 @@ main = hspec $ do
 
       it "refuses a mosque without all six timings" $ do
         cookie <- signIn
-        postForm "/mosques/new" [("Cookie", cookie)] "name=Noor+Masjid&address=Supela&timezone=Asia%2FKolkata"
+        postForm "/mosques/new" [("Cookie", cookie)]
+          ("address=Supela&timezone=Asia%2FKolkata&location=" <> formValue noorLink)
           `shouldRespondWith` 400
 
     describe "editing a mosque" $ do
@@ -1229,6 +1307,13 @@ main = hspec $ do
           `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/2"] }
         logLines <- readLog
         liftIO (map (T.isInfixOf "asr: 16:00/16:15 -> 16:00/16:30") logLines `shouldBe` [True])
+
+      it "keeps the name from Google Maps" $ do
+        cookie <- signIn
+        postForm "/mosques/2/edit" [("Cookie", cookie)] ("name=Shri+Ram+Mandir&" <> editTimingsBody)
+          `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/2"] }
+        logLines <- readLog
+        liftIO (logLines `shouldSatisfy` (not . any (T.isInfixOf "name:")))
 
     describe "following" $ do
       it "asks you to sign in first, then returns to the mosque" $
@@ -1285,11 +1370,16 @@ main = hspec $ do
           `shouldRespondWith` 302
 
   withState (authAppWith (\c -> c { configResolveLink = resolveTestLink })) $
-    describe "adding a mosque from a short link" $
-      it "follows the link to find the location" $ do
+    describe "adding a mosque from a short link" $ do
+      it "follows the link to fill in the name" $ do
+        cookie <- signIn
+        response <- postForm "/mosques/new/link" [("Cookie", cookie)] ("location=" <> formValue shortNoorLink)
+        liftIO (BL.toStrict (simpleBody response) `shouldSatisfy` BS.isInfixOf "Noor Masjid")
+
+      it "follows the link when saving too" $ do
         cookie <- signIn
         let body = BL.fromStrict (fst (BS.breakSubstring "&location=" (BL.toStrict newMosqueBody)))
-              <> "&location=" <> BL.fromStrict (encodeUtf8 shortNoorLink)
+              <> "&location=" <> formValue shortNoorLink
               <> BL.fromStrict (snd (BS.breakSubstring "&fajr_azan" (BL.toStrict newMosqueBody)))
         postForm "/mosques/new" [("Cookie", cookie)] body
           `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/5"] }

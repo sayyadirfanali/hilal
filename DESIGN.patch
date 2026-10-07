@@ -1,0 +1,45 @@
+--- a/DESIGN.md	2026-10-07 18:06:39.736583296 +0000
++++ b/DESIGN.md	2026-10-07 18:06:39.777287315 +0000
+@@ -215,7 +215,7 @@
+ Settings that differ between development, tests, and production live in a `Config` value passed to `app`.
+ 
+ Until launch, the schema lives in `schema.sql`, using `CREATE TABLE IF NOT EXISTS`, and runs at every startup.
+-After any schema change, delete hilal.db and let it be recreated; `seed_db.sh` does this and loads test data, whose mosques have no Google id.
++After any schema change, delete hilal.db and let it be recreated empty; mosques are then added through Hilal itself, as on the server.
+ At launch, schema.sql becomes the first numbered migration, and every later change is a new append-only migration tracked with PRAGMA user_version.
+ Never edit a migration after it has been deployed.
+ 
+@@ -243,19 +243,20 @@
+ 
+ `make deploy` does everything from the development machine, over SSH:
+ 
+-1. rsync copies the folder to the server, skipping `.git/` and everything `.gitignore` lists, with `--delete`;
++1. rsync copies the folder to the server, skipping `.git/` and everything `.gitignore` lists except `hilal.env`, with `--delete --delete-after`;
+ 2. the server builds Hilal with ghcup, so it links against Fedora's own libraries, and installs the program as `hilal` in the folder;
+ 3. it copies `deploy/hilal.service` to `/etc/systemd/system/` and restarts Hilal.
+ 
+ Each step runs only if the one before succeeded, so a failed build never replaces the running program.
+ Replacing the program file doesn't stop the running one; the restart switches to it.
++`--delete-after` deletes only once the new `.gitignore` has arrived, because the server decides what to delete from its own copy; deleting earlier removed `hilal.env` the first time it was added to `.gitignore`.
+ `make vendor` downloads Tailwind, daisyUI, MapLibre and the fonts on the server, once and whenever `install_vendor.sh` changes, because they are built for each machine.
+ `make status` and `make log` show the service's state and output.
+ The server's SSH host and folder are in `config.mk`, which git ignores, because the repository is public.
+ 
+-What exists only on the server is listed in `.gitignore`, so rsync neither sends it nor deletes it: the built `hilal`, `hilal.db` and `edits.log`, the downloaded `vendor/`, and `hilal.env`.
+-The local test database is never copied over by a deploy; when that is wanted before launch, it is copied by hand with Hilal stopped.
+-Hilal never seeds its database; `seed_db.sh` is for the development machine only.
++What exists only on the server is listed in `.gitignore`, so rsync neither sends it nor deletes it: the built `hilal`, `hilal.db` and `edits.log`, and the downloaded `vendor/`.
++The local database is never copied over by a deploy.
++Hilal never seeds its database, on the server or locally.
+ Until launch, a schema change means deleting `hilal.db` on the server too, losing its data.
+ 
+ `deploy/` holds the two files the server needs:
+@@ -269,7 +270,7 @@
+ - `BREVO_API_KEY` and `HILAL_MAIL_FROM` send sign-in codes by email;
+ - `HILAL_DEMO_CODE`, never set on the server, makes every code that value, for offline demos.
+ 
+-The first three are in `hilal.env`, created by hand on the server, readable only by its owner, and never synced or committed.
++The first three are in `hilal.env`, readable only by its owner, kept on the development machine and sent by `make deploy`, and never committed.
+ Without these variables, as when running locally with `cabal run`, codes are printed to the terminal instead.
+ 
+ Nginx terminates HTTPS, with a certificate from Let's Encrypt through certbot, and compresses responses; Hilal itself speaks plain HTTP on port 8080.
