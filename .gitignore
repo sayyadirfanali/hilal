@@ -6,3 +6,6 @@
 dist-newstyle/
 static/app.gen.css
 vendor/
+hilal.env
+/hilal
+config.mk
