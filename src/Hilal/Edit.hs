@@ -38,6 +38,8 @@ data MosqueForm = MosqueForm
   , formAddress  :: Text
   , formTimezone :: Text
   , formLocation :: Text -- the place's link; only used when adding
+  , formLat      :: Text -- the pin placed on the map; only used when adding
+  , formLng      :: Text
   , formTimes    :: [(Prayer, (Text, Text))]
   }
   deriving (Show, Eq)
@@ -52,11 +54,11 @@ data ValidMosque = ValidMosque
 
 emptyForm :: MosqueForm
 emptyForm =
-  MosqueForm "" "" "Asia/Kolkata" "" (map (\p -> (p, ("", ""))) [minBound .. maxBound])
+  MosqueForm "" "" "Asia/Kolkata" "" "" "" (map (\p -> (p, ("", ""))) [minBound .. maxBound])
 
 formFromMosque :: Mosque -> [(Prayer, PrayerTime)] -> MosqueForm
 formFromMosque m timings =
-  MosqueForm (mosqueName m) (mosqueAddress m) (mosqueTimezone m) "" (map getTimes [minBound .. maxBound])
+  MosqueForm (mosqueName m) (mosqueAddress m) (mosqueTimezone m) "" "" "" (map getTimes [minBound .. maxBound])
   where
     getTimes p = (p, maybe ("", "") clockPair (lookup p timings))
     clockPair t = (formatClock (ptAzan t), formatClock (ptJamaat t))
@@ -96,8 +98,8 @@ logLine :: UTCTime -> UserId -> MosqueId -> Text -> Text
 logLine now (UserId u) (MosqueId m) change =
   formatTimestamp now <> " user=" <> T.pack (show u) <> " mosque=" <> T.pack (show m) <> " " <> change
 
-creationLog :: ValidMosque -> Place -> [Text]
-creationLog v p =
+creationLog :: ValidMosque -> Place -> Coords -> [Text]
+creationLog v p (Coords lat lng) =
   ( "created name=" <> quoted (validName v)
       <> " address=" <> quoted (validAddress v)
       <> " timezone=" <> quoted (validTimezone v)
@@ -106,8 +108,6 @@ creationLog v p =
       <> " lng=" <> T.pack (show lng)
   )
     : map (\(pr, t) -> prayerToText pr <> ": " <> times t) (validTimings v)
-  where
-    Coords lat lng = placeCoords p
 
 editLog :: Mosque -> [(Prayer, PrayerTime)] -> ValidMosque -> [Text]
 editLog m old v =

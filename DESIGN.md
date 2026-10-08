@@ -54,16 +54,26 @@ Every POST route checks that the `Origin` header, when present, matches the `Hos
 
 ## Mosques
 A mosque is added from its Google Maps link, because Google Maps already lists almost every mosque, and sharing a link is something everyone knows how to do; nobody in India types latitude and longitude.
-Adding has two steps: first the link, then a form with the name filled in, for the address in the form "locality, city", the time zone, and all six timings.
+In the app, the mosque is shared from Google Maps to "Add to Hilal", which opens the first step with the link filled in; elsewhere the link is pasted.
+Adding has two steps: first the link, then a form with the name shown and the address filled in, the time zone, and all six timings; the location is worked out from the link.
 Requiring all six means every mosque is listed and followable from the moment it is added.
 The time zone is preselected from the phone's own setting with a few lines of JavaScript, falling back to `Asia/Kolkata`.
-Both steps work without JavaScript.
+Both steps work without JavaScript, unless the location has to be placed on a map, which needs it.
 
-From the link, Hilal takes the place's name, its pin, and Google's id for the place; a link carries nothing else, so the address is typed.
+From the link, Hilal takes the place's name, its address, its Plus Code, and Google's id for the place.
+Links shared from the Google Maps app read like `/maps/place/6922+H4H Jama Masjid, Sector 6, Bhilai, Chhattisgarh 490006/data=!…!1s0x…:0x…`: a Plus Code, the name, the address after the first comma, and the id.
+The address is editable, so it can be shortened to "locality, city"; the name is not.
+
+Those links carry no coordinates, and Google gives them out only through its paid Places API, whose terms forbid keeping them or showing them on another map; Google's own page for a place, fetched by a server, centres on where it thinks the visitor is, not the mosque.
+But a Plus Code is a location, to a few metres, in the open Open Location Code standard; Google shortens it by leaving out its region, which any point within about 50 km restores.
+So Hilal looks up the town in the link's address, first the whole address, then without its first part, but never the state alone, which could be too far away, and completes the Plus Code with it.
+Towns are looked up with Nominatim, OpenStreetMap's free address search, which needs no key; only the address from a Google Maps link is ever sent, with a User-Agent naming Hilal, as Nominatim's policy asks.
+A link with the place's own pin (`!3d…!4d…`) needs no lookup; a link's map centre (`@lat,lng`) is ignored, because it may be anywhere nearby.
+If the location still can't be worked out, the person taps the mosque on a map in the second step, and can drag the pin; the map starts at the phone's location, which stays on the phone.
 The field accepts the whole text Google Maps shares or a full Google Maps link; a link to a map view, or plain coordinates, has no place in it and is refused.
 Short links (`maps.app.goo.gl`) carry nothing themselves, so the server asks Google where they point, without following the link further, and reads that address.
 Only `maps.app.goo.gl` is ever contacted, so the field can't be used to make the server fetch other addresses.
-The second step carries the place as a link Hilal makes itself, and saving reads and checks it again.
+The second step carries the place as a link Hilal makes itself, with its name and id, and saving reads and checks it again.
 No Google library or API key is used, and nothing else, such as photos or reviews, is taken from Google.
 Google may change its links at any time; then nothing can be added until Hilal reads the new form.
 A mosque missing from Google Maps must be added there first; tutorials for that will come later.
@@ -73,7 +83,7 @@ The name must contain masjid, masjeed, masjed, musjid or mosque, in any case, or
 Idgahs, dargahs, madrasas and "palli", which Kerala also uses for churches, are left out on purpose.
 This works because the name comes from Google, and renaming a place on Google Maps needs an edit Google reviews.
 A real mosque whose Google name lacks these words is refused, with a suggestion to correct its name on Google Maps.
-Someone determined could still hand-make a fake Google link; the check stops mistakes and casual vandalism, not fraud, which stays the superadmin's job.
+Someone determined could still hand-make a fake Google link, or misplace a real mosque's location; the check stops mistakes and casual vandalism, not fraud, which stays the superadmin's job.
 
 A place can be added only once: Google's id for it is stored, unique, and adding it again points to the mosque already there.
 The name is always Google's, never typed, and can't be changed by editing, so a mosque can't be renamed into something else.
@@ -107,7 +117,8 @@ Recognising a mosque relies on its locality, distance, and place on the map, bec
 
 The phone's location is rounded to about 100 m before it leaves the phone, travels only in that page's address, and is never stored or logged.
 The map uses MapLibre, served from Hilal itself rather than a CDN, with map tiles from OpenFreeMap, which is free, needs no key, and is built from OpenStreetMap.
-Tile requests do tell OpenFreeMap roughly which area is being viewed; that is the one third party involved, and the map credits OpenStreetMap and OpenFreeMap as their terms require.
+Tile requests do tell OpenFreeMap roughly which area is being viewed, and the map credits OpenStreetMap and OpenFreeMap as their terms require.
+Adding a mosque also sends its town, from the Google Maps link, to Nominatim; nothing about the person adding it is sent.
 The map exists only where JavaScript runs; the list works without it.
 
 ## The mosque page
@@ -191,13 +202,15 @@ A change that would break installed apps goes under `/api/v2`, and `/api/v1` kee
 The app supports Android 8 and later, which covers nearly every phone in use in India.
 It is published on Play, for reach, and on F-Droid, from the same code.
 It is a WebView showing Hilal's pages; links to Hilal stay inside the app, and every other link opens in the browser.
+It appears as "Add to Hilal" in Android's Share menu for text, so a mosque shared from Google Maps opens the first step of adding it, with the link filled in.
+The app runs as a single task, so sharing reuses the open app rather than starting a second one.
 The back button goes back through the pages.
 The pages' green continues behind the status and navigation bars.
 When a page asks for the phone's location, the app asks for precise and approximate location together, so Android 12 and later let the person choose; approximate alone often found nothing, on the emulator and on a real phone.
 Either way, the page rounds the location to about 100 m before it leaves the phone.
 Backup and transfer to a new phone are turned off: the follows live on the server, and the session cookie must not leave the phone.
 Native code uses only Android itself and AndroidX, with no extra libraries; the scheduling logic mirrors `Hilal.Time` and has its own unit tests.
-The app is named Hilal, with application id `org.irfanali.hilal`, which can never change once published; the code's own package stays `com.example.hilalalarm`, which nobody sees.
+The app is named Hilal, with application id `org.irfanali.hilal`, which can never change once published; the code's own package is the same.
 Its icon is the gold crescent on green, drawn as vectors, so no images at different sizes are needed; `icon.svg` is the same drawing, for store listings.
 The server's address is in `Config.kt`, one in `src/debug` and one in `src/release`, rather than generated `BuildConfig` code.
 Release builds talk to `https://hilal.irfanali.org`.
@@ -227,7 +240,7 @@ Modules:
 - `Hilal.Query`: all SQL queries.
 - `Hilal.Time`: time zones and next-prayer logic.
 - `Hilal.Hijri`: Hijri dates, from the generated table in `Hilal.HijriTable`.
-- `Hilal.Location`: reading places from Google Maps links, following short links, checking that a place is named as a mosque, and distances.
+- `Hilal.Location`: reading places from Google Maps links, following short links, checking that a place is named as a mosque, completing Plus Codes with a town from Nominatim, and distances.
 - `Hilal.Auth`: codes, tokens, hashing, cookies, sign-in limits, and request checks.
 - `Hilal.Edit`: the mosque form, its validation, and edit-log lines.
 - `Hilal.Email`: sending sign-in codes through Brevo.
@@ -313,7 +326,7 @@ Every query has a test, because the compiler cannot check SQL against the Haskel
 Shared test data lives in `seed` in `test/Tests.hs`, and every test gets a fresh copy of it.
 Query tests use an in-memory database; route tests use a temporary file, because each request opens its own connection.
 Route tests that need sign-in capture codes and edit-log lines through the test configuration.
-Tests never contact Google: the short-link resolver is part of the configuration, and tests replace it.
+Tests never contact Google or Nominatim: the short-link resolver and the town lookup are part of the configuration, and tests replace them.
 Test data is fictional or uses well-known public mosques, never personal details.
 
 ## Privacy

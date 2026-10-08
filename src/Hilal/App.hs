@@ -16,6 +16,7 @@ import Data.Time.Zones (utcToLocalTimeTZ)
 import Database.SQLite.Simple (withTransaction)
 import Lucid (Html, renderText)
 import Network.HTTP.Types.Status (status304, status400, status401, status403, status404, status429, status503)
+import Network.HTTP.Types.URI (urlEncode)
 import Network.Wai (Application)
 import Numeric (showHex)
 import System.IO (hPutStrLn, stderr)
@@ -54,7 +55,7 @@ import Hilal.Edit
   , validateForm
   )
 import Hilal.JSON (followedJson, notFoundJson, notSignedInJson, timingsJson)
-import Hilal.Location (Place (..), coordsFromParams, distanceMeters, isMosqueName, locatePlace, placeLink)
+import Hilal.Location (Place (..), coordsFromParams, distanceMeters, isMosqueName, locatePlace, placeLink, placePin)
 import Hilal.Query
   ( clearWrongCodes
   , countSentCodes
@@ -85,7 +86,7 @@ import Hilal.Query
   , updateMosque
   )
 import Hilal.Time (lookupZone, nextJamaat, upcomingToday)
-import Hilal.Types (Mosque (..), MosqueId (..), Prayer, PrayerTime, User (..), hasAllTimings, mosqueCoords, prayerToText)
+import Hilal.Types (Coords (..), Mosque (..), MosqueId (..), Prayer, PrayerTime, User (..), hasAllTimings, mosqueCoords, prayerToText)
 import Hilal.Views
   ( FollowState (..)
   , accountPage
@@ -110,6 +111,7 @@ data Config = Config
   , configLogEdit       :: Text -> IO ()
   , configDemoCode      :: Maybe Text                -- every sign-in code, for demos; never in production
   , configResolveLink   :: Text -> IO (Maybe Text)   -- where a Google Maps short link points
+  , configFindTown      :: Text -> IO (Maybe Coords) -- roughly where a town is, to complete a Plus Code
   }
 
 data SendOutcome = CodeSent | CodeTooSoon | TooManyCodes | TooManyWrongCodes | SendFailed | EmailBlocked
@@ -167,11 +169,14 @@ app cfg = scottyApp $ do
               searchMosques conn (Just (pageSize + 1)) q
             page (mosquesPage q Nothing (map (\m -> (m, Nothing)) (take pageSize found)) (length found > pageSize))
 
-  -- Adding has two steps: the Google Maps link, then the rest of the form,
-  -- with the name and location taken from the link.
-  get "/mosques/new" $
-    requireUser dbPath "/mosques/new" $ \_ ->
-      page (addLinkPage "" [] Nothing)
+  -- Adding has two steps: the Google Maps link, then the rest of the form, with the name
+  -- and address taken from the link, and a map to place the pin on.
+  -- The link may come in the address, from "Share to Hilal" in the app.
+  get "/mosques/new" $ do
+    -- Shared text is the name and the link on separate lines; a form field would join them.
+    shared <- maybe "" (T.unwords . T.words) <$> queryParamMaybe "location"
+    requireUser dbPath (addUrl shared) $ \_ ->
+      page (addLinkPage shared [] Nothing)
 
   post "/mosques/new/link" $ sameOriginOnly $
     requireUser dbPath "/mosques/new" $ \_ -> do
@@ -181,8 +186,9 @@ app cfg = scottyApp $ do
         Left refusal -> do
           status status400
           page refusal
-        Right place ->
-          page (mosqueFormPage "Add a mosque" "/mosques/new" [] (placeForm place emptyForm) [] True)
+        Right place -> do
+          pin <- liftIO (placePin (configFindTown cfg) place)
+          page (mosqueFormPage "Add a mosque" "/mosques/new" [] (placeForm place pin emptyForm) [] True)
 
   -- The link is read and checked again, so the name and location can't be swapped on the way.
   post "/mosques/new" $ sameOriginOnly $
@@ -194,19 +200,21 @@ app cfg = scottyApp $ do
           status status400
           page refusal
         Right place -> do
-          let form = placeForm place submitted
-          case validateForm form of
-            Left errors -> do
-              status status400
-              page (mosqueFormPage "Add a mosque" "/mosques/new" errors form [] True)
-            Right valid -> do
+          let form = submitted { formName = placeName place, formLocation = placeLink place }
+              pin  = coordsFromParams (formLat form) (formLng form)
+          case (validateForm form, pin) of
+            (Right valid, Just coords) -> do
               now <- liftIO getCurrentTime
               mid <- liftIO $ withDb dbPath $ \conn -> withTransaction conn $ do
-                newId <- createMosque conn (validName valid) (validAddress valid) (validTimezone valid) (placeId place) (placeCoords place)
+                newId <- createMosque conn (validName valid) (validAddress valid) (validTimezone valid) (placeId place) coords
                 forM_ (validTimings valid) $ uncurry (saveTiming conn now newId)
                 return newId
-              liftIO $ mapM_ (configLogEdit cfg . logLine now (userId user) mid) (creationLog valid place)
+              liftIO $ mapM_ (configLogEdit cfg . logLine now (userId user) mid) (creationLog valid place coords)
               redirect (TL.fromStrict (mosqueUrl mid))
+            (result, _) -> do
+              let pinErrors = maybe ["Please tap the mosque on the map to place its pin."] (const []) pin
+              status status400
+              page (mosqueFormPage "Add a mosque" "/mosques/new" (either id (const []) result <> pinErrors) form [] True)
 
   get "/mosques/:id" $ do
     found <- loadMosque dbPath =<< pathParam "id"
@@ -425,9 +433,22 @@ checkPlace dbPath resolve pasted = do
     notMosque =
       "Hilal only adds places that Google Maps names as a mosque. If this is a mosque, suggest an edit to its name on Google Maps so it includes \"Masjid\", then add it again."
 
--- The form with the name and the link from Google Maps, whatever was submitted for them.
-placeForm :: Place -> MosqueForm -> MosqueForm
-placeForm place f = f { formName = placeName place, formLocation = placeLink place }
+-- The second step's form, filled in from the link: the name, the address,
+-- and the place's location when Hilal could work it out; otherwise it is placed on a map.
+placeForm :: Place -> Maybe Coords -> MosqueForm -> MosqueForm
+placeForm place pin f =
+  f { formName     = placeName place
+    , formAddress  = placeAddress place
+    , formLocation = placeLink place
+    , formLat      = maybe "" (\(Coords lat _) -> T.pack (show lat)) pin
+    , formLng      = maybe "" (\(Coords _ lng) -> T.pack (show lng)) pin
+    }
+
+-- The first step's address, carrying a shared link through signing in.
+addUrl :: Text -> Text
+addUrl shared
+  | T.null shared = "/mosques/new"
+  | otherwise     = "/mosques/new?location=" <> TE.decodeUtf8 (urlEncode True (TE.encodeUtf8 shared))
 
 changeFollow :: FilePath -> FollowAction -> Text -> ActionM ()
 changeFollow dbPath action idText = do
@@ -484,11 +505,13 @@ readMosqueForm = do
   address  <- textParam "address"
   timezone <- textParam "timezone"
   location <- textParam "location"
+  lat      <- textParam "lat"
+  lng      <- textParam "lng"
   times <- forM [minBound .. maxBound] $ \p -> do
     azan   <- textParam (prayerToText p <> "_azan")
     jamaat <- textParam (prayerToText p <> "_jamaat")
     return (p, (azan, jamaat))
-  return (MosqueForm name address timezone location times)
+  return (MosqueForm name address timezone location lat lng times)
 
 textParam :: Text -> ActionM Text
 textParam key = fromMaybe "" <$> formParamMaybe (TL.fromStrict key)
