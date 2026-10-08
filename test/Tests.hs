@@ -21,12 +21,14 @@ import Database.SQLite.Simple (Connection, Only (..), execute, execute_, query_)
 import Lucid (renderText)
 import Network.HTTP.Types (Header, statusCode, urlEncode)
 import Network.Wai (Application)
+import System.Directory (createDirectoryIfMissing)
 import System.IO.Temp (emptySystemTempFile)
 import Test.Hspec
 import Test.Hspec.Wai
 
 import Hilal.App (Config (..), app)
 import Hilal.Assets (interFontPath, maplibreJsPath)
+import Hilal.Azan (Recording (..), mosqueRecordings)
 import Hilal.Auth
   ( CodeCheck (..)
   , canResend
@@ -119,6 +121,7 @@ testConfig path = Config
   , configDemoCode      = Nothing
   , configResolveLink   = \_ -> return Nothing
   , configFindTown      = \_ -> return Nothing
+  , configAzanDir       = path <> "-azan"
   }
 
 testApp :: IO Application
@@ -649,21 +652,26 @@ main = hspec $ do
 
   describe "timingsJson" $ do
     it "encodes the agreed shape" $
-      decode (timingsJson jamaMasjid [(Fajr, timesAt 5)]) `shouldBe` Just
+      decode (timingsJson jamaMasjid [Azan] [(Fajr, timesAt 5)]) `shouldBe` Just
         (object
-          [ "mosque"   .= (1 :: Int)
-          , "timezone" .= ("Asia/Kolkata" :: Text)
-          , "timings"  .= object
+          [ "mosque"     .= (1 :: Int)
+          , "timezone"   .= ("Asia/Kolkata" :: Text)
+          , "timings"    .= object
               [ "fajr" .= object
                   [ "azan"   .= ("05:00" :: Text)
                   , "jamaat" .= ("05:15" :: Text)
                   ]
               ]
+          , "recordings" .= ["azan" :: Text]
           ])
 
     it "changes when a time changes, so the ETag does too" $
-      timingsJson jamaMasjid [(Fajr, timesAt 5)]
-        `shouldNotBe` timingsJson jamaMasjid [(Fajr, timesAt 6)]
+      timingsJson jamaMasjid [] [(Fajr, timesAt 5)]
+        `shouldNotBe` timingsJson jamaMasjid [] [(Fajr, timesAt 6)]
+
+    it "changes when a recording is added, so the ETag does too" $
+      timingsJson jamaMasjid [] [(Fajr, timesAt 5)]
+        `shouldNotBe` timingsJson jamaMasjid [Azan] [(Fajr, timesAt 5)]
 
   describe "followedJson" $ do
     it "lists each mosque's id and name" $
@@ -1485,3 +1493,45 @@ main = hspec $ do
         liftIO $ do
           body `shouldSatisfy` BS.isInfixOf "value=\"21.2014"
           body `shouldSatisfy` (not . BS.isInfixOf "pin-map")
+
+  withState authApp $
+    describe "Azan recordings" $ do
+      let addRecording name contents = do
+            db <- stateDb <$> getState
+            liftIO $ do
+              createDirectoryIfMissing True (db <> "-azan")
+              BS.writeFile (db <> "-azan/" <> name) contents
+
+      it "are missing until the superadmin adds them" $
+        get "/mosques/2/azan" `shouldRespondWith` 404
+
+      it "are served once added, with their type" $ do
+        addRecording "2.ogg" "OggS recording"
+        get "/mosques/2/azan" `shouldRespondWith` "OggS recording"
+          { matchHeaders = ["Content-Type" <:> "audio/ogg"] }
+
+      it "are 304 when the app already has the current one" $ do
+        addRecording "2.mp3" "ID3 recording"
+        response <- get "/mosques/2/azan"
+        case lookup "ETag" (simpleHeaders response) of
+          Nothing -> liftIO (expectationFailure "response had no ETag")
+          Just etag ->
+            request "GET" "/mosques/2/azan" [("If-None-Match", etag)] "" `shouldRespondWith` 304
+
+      it "keep Fajr's own recording apart" $ do
+        addRecording "2.ogg" "OggS recording"
+        get "/mosques/2/azan-fajr" `shouldRespondWith` 404
+        addRecording "2-fajr.m4a" "fajr recording"
+        get "/mosques/2/azan-fajr" `shouldRespondWith` "fajr recording"
+          { matchHeaders = ["Content-Type" <:> "audio/mp4"] }
+
+      it "are listed with the mosque's timings" $ do
+        addRecording "2-fajr.ogg" "OggS recording"
+        db <- stateDb <$> getState
+        found <- liftIO (mosqueRecordings (db <> "-azan") (MosqueId 2))
+        liftIO (found `shouldBe` [FajrAzan])
+        response <- get "/api/v1/mosques/2/timings"
+        liftIO (BL.toStrict (simpleBody response) `shouldSatisfy` BS.isInfixOf "\"recordings\":[\"azan-fajr\"]")
+
+      it "are 404 for an id that isn't a number" $
+        get "/mosques/abc/azan" `shouldRespondWith` 404

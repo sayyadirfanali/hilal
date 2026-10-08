@@ -10,6 +10,7 @@ import Data.Aeson.Key qualified as Key
 import Data.ByteString.Lazy qualified as BL
 import Data.Text (Text)
 
+import Hilal.Azan (Recording, recordingName)
 import Hilal.Types
   ( Mosque (..)
   , MosqueId (..)
@@ -19,12 +20,14 @@ import Hilal.Types
   , prayerToText
   )
 
-timingsJson :: Mosque -> [(Prayer, PrayerTime)] -> BL.ByteString
-timingsJson mosque timings =
+-- The recordings it lists can be fetched from /mosques/:id/azan and /mosques/:id/azan-fajr.
+timingsJson :: Mosque -> [Recording] -> [(Prayer, PrayerTime)] -> BL.ByteString
+timingsJson mosque recordings timings =
   encode $ object
-    [ "mosque"   .= mid
-    , "timezone" .= mosqueTimezone mosque
-    , "timings"  .= object (map timing timings)
+    [ "mosque"     .= mid
+    , "timezone"   .= mosqueTimezone mosque
+    , "timings"    .= object (map timing timings)
+    , "recordings" .= map recordingName recordings
     ]
   where
     MosqueId mid = mosqueId mosque
@@ -49,3 +52,4 @@ notFoundJson = object ["error" .= ("not found" :: Text)]
 
 notSignedInJson :: Value
 notSignedInJson = object ["error" .= ("not signed in" :: Text)]
+

@@ -17,6 +17,7 @@ library
     Hilal.App
     Hilal.Assets
     Hilal.Auth
+    Hilal.Azan
     Hilal.DB
     Hilal.Edit
     Hilal.Email
@@ -34,6 +35,7 @@ library
                  , cookie
                  , crypton
                  , direct-sqlite
+                 , directory
                  , http-client
                  , http-client-tls
                  , http-types
@@ -64,6 +66,7 @@ test-suite test
   build-depends:  hilal
                 , aeson
                 , bytestring
+                , directory
                 , hspec
                 , hspec-wai
                 , http-types
@@ -75,3 +78,4 @@ test-suite test
                 , wai
                 , wai-extra
                 , temporary
+

@@ -44,6 +44,7 @@ main = do
     , configDemoCode      = T.pack <$> demoCode
     , configResolveLink   = resolveLink
     , configFindTown      = findTown
+    , configAzanDir       = "azan"
     }
   putStrLn "hilal listening on http://localhost:8080"
   run 8080 application

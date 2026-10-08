@@ -3,6 +3,7 @@ module Hilal.App (Config (..), app) where
 import Control.Exception (SomeException, try)
 import Control.Monad (forM, forM_, when)
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.List (sortOn)
 import Data.Maybe (fromMaybe)
@@ -23,6 +24,7 @@ import System.IO (hPutStrLn, stderr)
 import Web.Scotty hiding (next)
 
 import Hilal.Assets (fnv1a, interFont, maplibreCss, maplibreJs, urduFont)
+import Hilal.Azan (Recording (..), findRecording, mosqueRecordings)
 import Hilal.Auth
   ( CodeCheck (..)
   , canResend
@@ -112,6 +114,7 @@ data Config = Config
   , configDemoCode      :: Maybe Text                -- every sign-in code, for demos; never in production
   , configResolveLink   :: Text -> IO (Maybe Text)   -- where a Google Maps short link points
   , configFindTown      :: Text -> IO (Maybe Coords) -- roughly where a town is, to complete a Plus Code
+  , configAzanDir       :: FilePath                  -- the superadmin's Azan recordings
   }
 
 data SendOutcome = CodeSent | CodeTooSoon | TooManyCodes | TooManyWrongCodes | SendFailed | EmailBlocked
@@ -276,8 +279,16 @@ app cfg = scottyApp $ do
     found <- loadMosque dbPath =<< pathParam "id"
     case found of
       Just (m, timings, _) | hasAllTimings timings ->
-        timingsResponse (timingsJson m timings)
+        recordings <- liftIO (mosqueRecordings (configAzanDir cfg) (mosqueId m))
+        etagResponse "application/json; charset=utf-8" (timingsJson m recordings timings)
       _ -> apiNotFound
+
+  -- A mosque's own Azan recordings, which the app downloads when it syncs and plays offline.
+  get "/mosques/:id/azan" $
+    recordingResponse (configAzanDir cfg) Azan =<< pathParam "id"
+
+  get "/mosques/:id/azan-fajr" $
+    recordingResponse (configAzanDir cfg) FajrAzan =<< pathParam "id"
 
   get "/api/v1/me/mosques" $ do
     user <- currentUser dbPath
@@ -560,8 +571,9 @@ notFoundResponse = do
   status status404
   page notFoundPage
 
-timingsResponse :: BL.ByteString -> ActionM ()
-timingsResponse resp = do
+-- Sent with an ETag, so the app always revalidates and an unchanged response costs a tiny 304.
+etagResponse :: TL.Text -> BL.ByteString -> ActionM ()
+etagResponse contentType resp = do
   let etag = etagOf resp
   setHeader "ETag" etag
   setHeader "Cache-Control" "no-cache"
@@ -569,8 +581,21 @@ timingsResponse resp = do
   if maybe False (matchesETag etag) ifNoneMatch
     then status status304
     else do
-      setHeader "Content-Type" "application/json; charset=utf-8"
+      setHeader "Content-Type" contentType
       raw resp
+
+recordingResponse :: FilePath -> Recording -> Text -> ActionM ()
+recordingResponse dir recording idText = do
+  found <- case parseMosqueId idText of
+    Nothing  -> return Nothing
+    Just mid -> liftIO (findRecording dir mid recording)
+  case found of
+    Nothing -> do
+      status status404
+      text "No recording"
+    Just (path, contentType) -> do
+      contents <- liftIO (BS.readFile path)
+      etagResponse (TL.fromStrict contentType) (BL.fromStrict contents)
 
 etagOf :: BL.ByteString -> TL.Text
 etagOf b = "\"" <> TL.pack (showHex (fnv1a (BL.toStrict b)) "") <> "\""
