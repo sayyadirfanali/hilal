@@ -13,7 +13,7 @@ import System.Exit (die)
 import Hilal.App (Config (..), app)
 import Hilal.DB (withDb)
 import Hilal.Email (newMailer)
-import Hilal.Location (newLinkResolver)
+import Hilal.Location (newLinkResolver, newTownFinder)
 import Hilal.Migrate (migrate)
 
 main :: IO ()
@@ -32,6 +32,7 @@ main = do
     Nothing -> return ()
   sendCode <- codeSender production
   resolveLink <- newLinkResolver
+  findTown <- newTownFinder
   withDb dbPath migrate
   application <- app Config
     { configDb            = dbPath
@@ -42,6 +43,7 @@ main = do
         TIO.appendFile "edits.log" (line <> "\n")
     , configDemoCode      = T.pack <$> demoCode
     , configResolveLink   = resolveLink
+    , configFindTown      = findTown
     }
   putStrLn "hilal listening on http://localhost:8080"
   run 8080 application
@@ -62,3 +64,4 @@ codeSender production = do
           die "BREVO_API_KEY and HILAL_MAIL_FROM must be set when HILAL_ENV=production."
       | otherwise ->
           return (\email code -> TIO.putStrLn ("sign-in code for " <> email <> ": " <> code))
+

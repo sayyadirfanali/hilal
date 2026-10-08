@@ -44,7 +44,7 @@ import Hilal.DB (withDb)
 import Hilal.Edit (MosqueForm (..), ValidMosque (..), changedTimings, editLog, emptyForm, validateForm)
 import Hilal.Hijri (HijriDate (..), HijriPart (..), hijriFromDay, hijriParts)
 import Hilal.JSON (followedJson, timingsJson)
-import Hilal.Location (Place (..), distanceMeters, isMosqueName, locatePlace, parsePlace, placeLink, shortLink)
+import Hilal.Location (Place (..), distanceMeters, isMosqueName, locatePlace, parsePlace, placeLink, placePin, recoverPlusCode, shortLink, townQueries)
 import Hilal.Migrate (migrate)
 import Hilal.Query
   ( clearWrongCodes
@@ -118,6 +118,7 @@ testConfig path = Config
   , configLogEdit       = \_ -> return ()
   , configDemoCode      = Nothing
   , configResolveLink   = \_ -> return Nothing
+  , configFindTown      = \_ -> return Nothing
   }
 
 testApp :: IO Application
@@ -149,7 +150,29 @@ authAppWith change = do
 
 -- A mosque on Google Maps, and the link Hilal makes for it.
 noorPlace :: Place
-noorPlace = Place "0x3a28dd1b2c3d4e5f:0xa1b2c3d4e5f60718" "Noor Masjid" (Coords 21.2101 81.3502)
+noorPlace = Place "0x3a28dd1b2c3d4e5f:0xa1b2c3d4e5f60718" "Noor Masjid" "" Nothing Nothing
+
+-- Where a short link from the Google Maps app really pointed, in October 2026:
+-- a Plus Code, the name and the address, Google's id, and no coordinates.
+-- The Plus Code, completed, is the mosque in Sector 6, Bhilai.
+sharedJamaLink :: Text
+sharedJamaLink =
+  "https://www.google.com/maps/place/6922%2BH4H+Jama+Masjid,+Sector+6,+Bhilai,+Chhattisgarh+490006/data=!4m2!3m1!1s0x3a29232891b406cd:0x703bd6abd867cef8!18m1!1e1?utm_source=mstt_1&entry=gps&g_st=ac"
+
+sharedJama :: Place
+sharedJama =
+  Place "0x3a29232891b406cd:0x703bd6abd867cef8" "Jama Masjid" "Sector 6, Bhilai, Chhattisgarh 490006" (Just "6922+H4H") Nothing
+
+-- Raipur, 30 km from the mosque: near enough to complete its Plus Code.
+raipur :: Coords
+raipur = Coords 21.2337 81.6778
+
+-- Whether two places are within a metre or so of each other.
+near :: Coords -> Coords -> Bool
+near (Coords a b) (Coords c d) = abs (a - c) < 0.00001 && abs (b - d) < 0.00001
+
+jamaPin :: Coords
+jamaPin = Coords 21.2014375 81.3503594
 
 noorLink :: Text
 noorLink = placeLink noorPlace
@@ -203,10 +226,10 @@ homeBody cookie = do
   response <- request "GET" "/" [("Cookie", cookie)] ""
   return (BL.toStrict (simpleBody response))
 
--- The second step of adding Noor Masjid; the name comes from the link.
+-- The second step of adding Noor Masjid, with its pin placed; the name comes from the link.
 newMosqueBody :: BL.ByteString
 newMosqueBody =
-  "address=Supela%2C+Bhilai&timezone=Asia%2FKolkata&location=" <> formValue noorLink
+  "address=Supela%2C+Bhilai&timezone=Asia%2FKolkata&lat=21.2101&lng=81.3502&location=" <> formValue noorLink
     <> "&fajr_azan=05:00&fajr_jamaat=05:15&zuhr_azan=13:00&zuhr_jamaat=13:15\
        \&asr_azan=16:30&asr_jamaat=16:45&maghrib_azan=18:00&maghrib_jamaat=18:05\
        \&isha_azan=19:30&isha_jamaat=19:45&jumuah_azan=13:00&jumuah_jamaat=13:30"
@@ -233,7 +256,7 @@ jamaMasjid = Mosque {
 
 validForm :: MosqueForm
 validForm =
-  MosqueForm "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" ""
+  MosqueForm "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" "" "" ""
     (map (\(p, t) -> (p, (formatClock (ptAzan t), formatClock (ptJamaat t)))) allSix)
 
 setTimes :: Prayer -> (Text, Text) -> MosqueForm -> MosqueForm
@@ -393,22 +416,25 @@ main = hspec $ do
       validateForm emptyForm `shouldSatisfy` isLeft
 
   describe "parsePlace" $ do
-    let jama = Place "0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88" "Jama Masjid" (Coords 21.2036 81.37)
+    let jamaId = "0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88"
 
-    it "reads the name, Google's id and the pin from a place link" $
+    it "reads the Plus Code, name, address and Google's id from a link shared from the app" $
+      parsePlace sharedJamaLink `shouldBe` Just sharedJama
+
+    it "reads the place's own pin when the link has one" $
       parsePlace "https://www.google.com/maps/place/Jama+Masjid/@21.2030,81.3690,17z/data=!3m1!4b1!4m6!3m5!1s0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88!8m2!3d21.2036!4d81.37!16s%2Fg%2F11b6"
-        `shouldBe` Just jama
+        `shouldBe` Just (Place jamaId "Jama Masjid" "" Nothing (Just (Coords 21.2036 81.37)))
 
-    it "uses the map's centre when the link has no pin" $
+    it "ignores the map's centre, which may be anywhere nearby" $
       parsePlace "https://www.google.com/maps/place/Jama+Masjid/@21.2036,81.37,17z/data=!1s0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88"
-        `shouldBe` Just jama
+        `shouldBe` Just (Place jamaId "Jama Masjid" "" Nothing Nothing)
 
     it "finds the link in the text Google Maps shares" $
-      parsePlace ("Jama Masjid\n" <> placeLink jama) `shouldBe` Just jama
+      parsePlace ("Jama Masjid\n" <> sharedJamaLink) `shouldSatisfy` isJust
 
     it "reads a link wrapped in Google's consent page" $
-      parsePlace "https://consent.google.com/m?continue=https://www.google.com/maps/place/Jama+Masjid/data%3D!1s0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88!3d21.2036!4d81.37"
-        `shouldBe` Just jama
+      parsePlace "https://consent.google.com/m?continue=https://www.google.com/maps/place/Jama+Masjid/data%3D!1s0x3a293cd4a1b5c5f7:0x5d2f5c3e1b0a9c88"
+        `shouldBe` Just (Place jamaId "Jama Masjid" "" Nothing Nothing)
 
     it "finds nothing in a link to a map view, which has no place" $
       parsePlace "https://www.google.com/maps/@21.2036,81.37,15z" `shouldBe` Nothing
@@ -416,17 +442,57 @@ main = hspec $ do
     it "finds nothing without Google's id for the place" $
       parsePlace "https://www.google.com/maps/place/Jama+Masjid/@21.2036,81.37,17z" `shouldBe` Nothing
 
+    it "finds nothing when the place has no name besides its Plus Code" $
+      parsePlace "https://www.google.com/maps/place/6922%2BH4H,+Bhilai/data=!1s0x1:0x2" `shouldBe` Nothing
+
     it "finds nothing in plain coordinates" $
       parsePlace "21.2036, 81.37" `shouldBe` Nothing
 
-    it "rejects coordinates out of range" $
-      parsePlace "https://www.google.com/maps/place/Jama+Masjid/data=!1s0x1:0x2!3d95.0!4d81.37" `shouldBe` Nothing
+    it "ignores a pin out of range" $
+      parsePlace "https://www.google.com/maps/place/Jama+Masjid/data=!1s0x1:0x2!3d95.0!4d81.37"
+        `shouldBe` Just (Place "0x1:0x2" "Jama Masjid" "" Nothing Nothing)
 
     it "finds nothing in a short link, which has to be followed first" $
       parsePlace "https://maps.app.goo.gl/abc123" `shouldBe` Nothing
 
     it "reads back the link Hilal makes" $
       parsePlace (placeLink noorPlace) `shouldBe` Just noorPlace
+
+  describe "recoverPlusCode" $ do
+    it "completes a shortened Plus Code with a point nearby" $
+      recoverPlusCode (Coords 21.21 81.35) "6922+H4H" `shouldSatisfy` maybe False (near jamaPin)
+
+    it "completes it with a point 30 km away just the same" $
+      recoverPlusCode raipur "6922+H4H" `shouldSatisfy` maybe False (near jamaPin)
+
+    it "places it in the wrong region with a point far away" $
+      recoverPlusCode (Coords 19.08 72.88) "6922+H4H" `shouldSatisfy` maybe False (not . near jamaPin)
+
+    it "reads a full Plus Code without needing the point" $
+      recoverPlusCode (Coords 0 0) "7MH36922+H4H" `shouldSatisfy` maybe False (near jamaPin)
+
+    it "rejects text that isn't a Plus Code" $
+      recoverPlusCode raipur "Jama+Masjid" `shouldBe` Nothing
+
+  describe "townQueries" $
+    it "looks up the address, then without its first part, never just the state" $
+      townQueries "Sector 6, Bhilai, Chhattisgarh 490006"
+        `shouldBe` ["Sector 6, Bhilai, Chhattisgarh 490006", "Bhilai, Chhattisgarh 490006"]
+
+  describe "placePin" $ do
+    it "completes the Plus Code with the town in the link's address" $
+      placePin (\_ -> return (Just raipur)) sharedJama `shouldReturn` recoverPlusCode raipur "6922+H4H"
+
+    it "tries the address without its first part when the whole isn't found" $
+      placePin (\q -> return (if q == "Bhilai, Chhattisgarh 490006" then Just raipur else Nothing)) sharedJama
+        `shouldReturn` recoverPlusCode raipur "6922+H4H"
+
+    it "uses the link's own pin without looking anything up" $
+      placePin (\_ -> error "should not be called") sharedJama { placeCoords = Just (Coords 21.2036 81.37) }
+        `shouldReturn` Just (Coords 21.2036 81.37)
+
+    it "is nothing when the town can't be found" $
+      placePin (\_ -> return Nothing) sharedJama `shouldReturn` Nothing
 
   describe "isMosqueName" $ do
     it "accepts the common English spellings, in any case" $
@@ -1233,6 +1299,25 @@ main = hspec $ do
         cookie <- signIn
         request "GET" "/mosques/new" [("Cookie", cookie)] "" `shouldRespondWith` 200
 
+      it "fills in a link shared to Hilal" $ do
+        cookie <- signIn
+        response <- request "GET" "/mosques/new?location=https%3A%2F%2Fmaps.app.goo.gl%2Fnoor" [("Cookie", cookie)] ""
+        liftIO (BL.toStrict (simpleBody response) `shouldSatisfy` BS.isInfixOf "https://maps.app.goo.gl/noor")
+
+      it "keeps a shared link through signing in" $
+        get "/mosques/new?location=https%3A%2F%2Fmaps.app.goo.gl%2Fnoor" `shouldRespondWith` 302
+          { matchHeaders = ["Location" <:> "/sign-in?next=%2Fmosques%2Fnew%3Flocation%3Dhttps%253A%252F%252Fmaps.app.goo.gl%252Fnoor"] }
+
+      it "fills in the address from a link shared from the app" $ do
+        cookie <- signIn
+        response <- postForm "/mosques/new/link" [("Cookie", cookie)] ("location=" <> formValue sharedJamaLink)
+        liftIO (BL.toStrict (simpleBody response) `shouldSatisfy` BS.isInfixOf "Sector 6, Bhilai, Chhattisgarh 490006")
+
+      it "asks for the pin on a map when the location can't be worked out" $ do
+        cookie <- signIn
+        response <- postForm "/mosques/new/link" [("Cookie", cookie)] ("location=" <> formValue sharedJamaLink)
+        liftIO (BL.toStrict (simpleBody response) `shouldSatisfy` BS.isInfixOf "pin-map")
+
       it "fills in the name from the link" $ do
         cookie <- signIn
         response <- postForm "/mosques/new/link" [("Cookie", cookie)] ("location=" <> formValue noorLink)
@@ -1279,6 +1364,13 @@ main = hspec $ do
         cookie <- signIn
         postForm "/mosques/new" [("Cookie", cookie)] newMosqueBody `shouldRespondWith` 302
         postForm "/mosques/new" [("Cookie", cookie)] newMosqueBody `shouldRespondWith` 400
+
+      it "refuses a mosque without its pin" $ do
+        cookie <- signIn
+        let (before, rest) = BS.breakSubstring "&lat=" (BL.toStrict newMosqueBody)
+            after = snd (BS.breakSubstring "&location=" rest)
+        postForm "/mosques/new" [("Cookie", cookie)] (BL.fromStrict (before <> after))
+          `shouldRespondWith` 400
 
       it "refuses a mosque without a location" $ do
         cookie <- signIn
@@ -1383,3 +1475,13 @@ main = hspec $ do
               <> BL.fromStrict (snd (BS.breakSubstring "&fajr_azan" (BL.toStrict newMosqueBody)))
         postForm "/mosques/new" [("Cookie", cookie)] body
           `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/5"] }
+
+  withState (authAppWith (\c -> c { configFindTown = \_ -> return (Just raipur) })) $
+    describe "adding a mosque shared from the app" $
+      it "works out its location from the Plus Code, with no map" $ do
+        cookie <- signIn
+        response <- postForm "/mosques/new/link" [("Cookie", cookie)] ("location=" <> formValue sharedJamaLink)
+        let body = BL.toStrict (simpleBody response)
+        liftIO $ do
+          body `shouldSatisfy` BS.isInfixOf "value=\"21.2014"
+          body `shouldSatisfy` (not . BS.isInfixOf "pin-map")

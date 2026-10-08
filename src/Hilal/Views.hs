@@ -584,13 +584,29 @@ mosqueFormPage title action errors form upcoming adding =
   layout (title <> " · Hilal") NoTab (bandTitle title) $ do
     errorList errors
     form_ [method_ "post", action_ action, class_ "flex flex-col gap-4"] $ do
-      when adding $
+      when adding $ do
         input_ [type_ "hidden", name_ "location", value_ (formLocation form)]
+        input_ [type_ "hidden", id_ "lat", name_ "lat", value_ (formLat form)]
+        input_ [type_ "hidden", id_ "lng", name_ "lng", value_ (formLng form)]
       div_ [class_ "rounded-box border border-base-300 bg-base-100 p-4"] $ do
         fieldset_ [class_ "fieldset"] $ do
           span_ [class_ "fieldset-legend"] "Name"
           p_ [class_ "text-base font-semibold"] (toHtml (formName form))
           p_ [class_ "label whitespace-normal"] "As named on Google Maps."
+        when (adding && not needsPin) $
+          fieldset_ [class_ "fieldset"] $ do
+            span_ [class_ "fieldset-legend"] "Location"
+            p_ [class_ "text-base"] "Found."
+        when needsPin $
+          fieldset_ [class_ "fieldset"] $ do
+            span_ [class_ "fieldset-legend"] "Location"
+            p_ [class_ "label whitespace-normal"]
+              "Hilal couldn't work out where this mosque is. Zoom in and tap it on the map; you can drag the pin to adjust it."
+            link_ [rel_ "stylesheet", href_ maplibreCssPath]
+            div_ [id_ "pin-map", class_ "h-72 w-full overflow-hidden rounded-box border border-base-300"] ""
+            p_ [id_ "pin-status", role_ "status", class_ "label whitespace-normal"] ""
+            noscript_ $
+              p_ [class_ "text-sm text-warning"] "Placing the pin needs JavaScript, which is turned off."
         fieldset_ [class_ "fieldset"] $ do
           label_ [for_ "address", class_ "fieldset-legend"] "Address"
           input_
@@ -619,7 +635,12 @@ mosqueFormPage title action errors form upcoming adding =
       button_ [type_ "submit", class_ "btn btn-primary"] "Save"
     when (adding && null errors) $
       script_ [] (toHtmlRaw timezoneScript)
+    when needsPin $ do
+      script_ [src_ maplibreJsPath] ("" :: Text)
+      script_ [] (toHtmlRaw pinScript)
   where
+    -- Only when the link didn't give the location does the person place it on a map.
+    needsPin = adding && (T.null (formLat form) || T.null (formLng form))
     zones
       | formTimezone form `elem` zoneNames = zoneNames
       | otherwise                          = formTimezone form : zoneNames
@@ -644,6 +665,45 @@ mosqueFormPage title action errors form upcoming adding =
         , makeAttributes "aria-label" (prayerLabel p <> " " <> label)
         , class_ "input w-full"
         ]
+
+-- The pin goes where the mosque is tapped, and can be dragged; its coordinates fill the hidden fields.
+-- The map starts at a pin already placed, or else at the phone's location, which stays on the phone;
+-- failing both, it shows all of India.
+pinScript :: Text
+pinScript =
+  "(function () {\
+  \  var el = document.getElementById('pin-map');\
+  \  var lat = document.getElementById('lat'), lng = document.getElementById('lng');\
+  \  var status = document.getElementById('pin-status');\
+  \  if (!el || !lat || !lng || !window.maplibregl) return;\
+  \  var map = new maplibregl.Map({ container: el, style: 'https://tiles.openfreemap.org/styles/liberty', center: [78.96, 22.59], zoom: 4 });\
+  \  map.addControl(new maplibregl.NavigationControl({ showCompass: false }));\
+  \  var marker = null;\
+  \  function record(ll) {\
+  \    lat.value = ll.lat.toFixed(6);\
+  \    lng.value = ll.lng.toFixed(6);\
+  \    status.textContent = 'Pin placed. Drag it, or tap elsewhere, to move it.';\
+  \  }\
+  \  function place(ll) {\
+  \    if (!marker) {\
+  \      marker = new maplibregl.Marker({ color: '#16a34a', draggable: true }).setLngLat(ll).addTo(map);\
+  \      marker.on('dragend', function () { record(marker.getLngLat()); });\
+  \    } else {\
+  \      marker.setLngLat(ll);\
+  \    }\
+  \    record(marker.getLngLat());\
+  \  }\
+  \  map.on('click', function (e) { place(e.lngLat); });\
+  \  if (lat.value && lng.value) {\
+  \    var start = [parseFloat(lng.value), parseFloat(lat.value)];\
+  \    map.jumpTo({ center: start, zoom: 17 });\
+  \    place(start);\
+  \  } else if (navigator.geolocation) {\
+  \    navigator.geolocation.getCurrentPosition(function (p) {\
+  \      if (!marker) map.jumpTo({ center: [p.coords.longitude, p.coords.latitude], zoom: 16 });\
+  \    }, function () {}, { timeout: 15000, maximumAge: 600000 });\
+  \  }\
+  \})();"
 
 timezoneScript :: Text
 timezoneScript =
