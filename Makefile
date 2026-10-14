@@ -1,8 +1,8 @@
 include config.mk
 
-.PHONY: sync vendor build install deploy all status log
+.PHONY: sync vendor build install deploy all status log backup
 
-EXCLUDES = --include='hilal.env' --exclude='.git/' --filter=':- .gitignore' --exclude='dist-newstyle/' --exclude='vendor/'
+EXCLUDES = --include='hilal.env' --include='/azan/***' --exclude='.git/' --filter=':- .gitignore' --exclude='dist-newstyle/' --exclude='vendor/'
 
 sync:
 	rsync -avz --delete --delete-after $(EXCLUDES) -e ssh ./ $(REMOTE_HOST):$(REMOTE_DIR)/
@@ -26,3 +26,9 @@ status:
 
 log:
 	ssh $(REMOTE_HOST) "journalctl -u $(SERVICE_NAME)"
+
+backup:
+	ssh $(REMOTE_HOST) 'cd $(REMOTE_DIR) && mkdir -p backups && sqlite3 hilal.db ".backup backups/hilal-$$(date +%Y%m%d-%H%M%S).db" && ls -1t backups/hilal-*.db | tail -n +11 | xargs -r rm --'
+	mkdir -p backups
+	rsync -av $(REMOTE_HOST):$(REMOTE_DIR)/backups/ backups/
+	ls -1t backups/hilal-*.db | tail -n +31 | xargs -r rm --

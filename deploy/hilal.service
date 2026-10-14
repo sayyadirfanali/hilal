@@ -13,9 +13,12 @@ Restart=always
 RestartSec=5
 
 NoNewPrivileges=true
+# Files Hilal creates, like hilal.db and edits.log, readable only by their owner.
+UMask=0077
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/home/irfan/hilal
 
 [Install]
 WantedBy=multi-user.target
+

@@ -3,9 +3,11 @@
 *.db-wal
 *.log
 .env
+/hilal
+azan/
+backup/
+config.mk
 dist-newstyle/
+hilal.env
 static/app.gen.css
 vendor/
-hilal.env
-/hilal
-config.mk

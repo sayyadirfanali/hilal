@@ -22,6 +22,7 @@ module Hilal.Query
   , makeSession
   , getSessionUser
   , killSession
+  , deleteUser
   , followMosque
   , unfollowMosque
   , isFollowing
@@ -31,7 +32,7 @@ module Hilal.Query
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Time (UTCTime)
-import Database.SQLite.Simple (Connection, Only (..), execute, lastInsertRowId, query, (:.) (..))
+import Database.SQLite.Simple (Connection, Only (..), execute, lastInsertRowId, query, withTransaction, (:.) (..))
 
 import Hilal.Types
   ( Coords (..)
@@ -227,6 +228,16 @@ getSessionUser conn now tokenHash = do
 killSession :: Connection -> Text -> IO ()
 killSession conn tokenHash =
   execute conn "DELETE FROM sessions WHERE token_hash = ?" (Only tokenHash)
+
+-- Deletes an account: its sessions, follows and any pending code go, and its email is replaced.
+-- The row itself stays, blocked, so its id is never given to anyone else, since edits.log names users by id;
+-- "deleted:12" can't be signed in with, because an email needs an @.
+deleteUser :: Connection -> UserId -> Text -> IO ()
+deleteUser conn uid email = withTransaction conn $ do
+  execute conn "DELETE FROM sessions WHERE user_id = ?" (Only uid)
+  execute conn "DELETE FROM follows WHERE user_id = ?" (Only uid)
+  execute conn "DELETE FROM sign_in_codes WHERE email = ?" (Only email)
+  execute conn "UPDATE users SET email = 'deleted:' || id, blocked = 1 WHERE id = ?" (Only uid)
 
 followMosque :: Connection -> UTCTime -> UserId -> MosqueId -> IO ()
 followMosque conn now uid mid =

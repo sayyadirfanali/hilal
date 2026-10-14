@@ -11,6 +11,9 @@ module Hilal.Views
   , signInPage
   , codePage
   , accountPage
+  , deleteAccountPage
+  , accountDeletedPage
+  , privacyPage
   , clockDigits
   , clockPeriod
   , countdown
@@ -278,6 +281,7 @@ signInPage email next message =
         , class_ "input w-full"
         ]
       button_ [type_ "submit", class_ "btn btn-primary"] "Send code"
+    privacyLink
 
 codePage :: Text -> Text -> Maybe Text -> Html ()
 codePage email next message =
@@ -316,6 +320,97 @@ accountPage email superadmin =
         span_ [class_ "badge badge-secondary badge-sm mt-2"] "Superadmin"
     form_ [method_ "post", action_ "/sign-out"] $
       button_ [type_ "submit", class_ "btn btn-outline w-full"] "Sign out"
+    div_ [class_ "mt-6 flex justify-between text-sm"] $ do
+      a_ [href_ "/privacy", class_ "link link-accent"] "Privacy"
+      a_ [href_ "/account/delete", class_ "link text-error"] "Delete account"
+
+privacyLink :: Html ()
+privacyLink =
+  p_ [class_ "mt-4 text-sm"] $
+    a_ [href_ "/privacy", class_ "link link-accent"] "How Hilal uses your data"
+
+-- Asked once more, since nothing can be undone.
+deleteAccountPage :: Text -> Html ()
+deleteAccountPage email =
+  layout "Delete account · Hilal" AccountTab (bandTitle "Delete account") $ do
+    div_ [class_ "mb-4 rounded-box border border-base-300 bg-base-100 p-4"] $ do
+      p_ [class_ "mb-2"] $ do
+        "This deletes the account for "
+        strong_ [class_ "break-all"] (toHtml email)
+        ", the mosques it follows, and its sign-in on every device."
+      p_ [class_ "mb-2"] "The app on your phone stops sounding the Azan once it next connects."
+      p_ [class_ "text-base-content/70"] $ do
+        "Mosques and timings you added or edited stay, for everyone who follows them. "
+        "You can sign up again with the same email, as a new account."
+    form_ [method_ "post", action_ "/account/delete"] $
+      button_ [type_ "submit", class_ "btn btn-error w-full"] "Delete my account"
+    a_ [href_ "/account", class_ "link link-accent mt-4 inline-block text-sm"] "Keep my account"
+
+accountDeletedPage :: Html ()
+accountDeletedPage =
+  layout "Account deleted · Hilal" AccountTab (bandTitle "Account deleted") $ do
+    p_ [class_ "mb-4"] "Your account is deleted. Thank you for using Hilal."
+    a_ [href_ "/mosques", class_ "link link-accent"] "Browse mosques"
+
+privacyPage :: Html ()
+privacyPage =
+  layout "Privacy · Hilal" NoTab (bandTitle "Privacy") $
+    div_ [class_ "flex flex-col gap-4 rounded-box border border-base-300 bg-base-100 p-4 leading-relaxed"] $ do
+      p_ [class_ "text-sm text-base-content/70"] "Last updated 13 October 2026"
+      p_ $ do
+        "Hilal tells you the Azan and Jamaat times of the mosques you follow. "
+        "It is run by Irfan Ali, who you can write to at "
+        a_ [href_ "mailto:irfan@irfanali.org", class_ "link link-accent"] "irfan@irfanali.org"
+        ". Hilal keeps as little about you as it can, shows no ads, and sells or shares nothing."
+
+      section "What Hilal keeps" $ bullets $ do
+        bullet "Your email address, so you can sign in."
+        bullet "The mosques you follow, so Hilal can show their times and the app can sound their Azan. No one else can see them."
+        bullet $ do
+          "A record of each mosque you add and each change you make, so vandalism can be found and undone. "
+          "It names your account by number, not by email, and never shows anyone who made a change."
+        bullet $ do
+          "While you sign in: the code we email you, stored scrambled, for 10 minutes; "
+          "and the codes sent and wrong codes tried, for a day, to stop abuse."
+        bullet "A cookie that keeps you signed in, for up to a year. Hilal sets no other cookies."
+
+      section "Your location" $ bullets $ do
+        bullet $ do
+          "Only when you ask for mosques near you. "
+          "Your phone rounds it to about 100 metres before sending it; it is used to sort the list, and never stored or logged."
+        bullet "The map beside that list is drawn from OpenFreeMap, which sees your internet address and the area shown, as any website you load does."
+
+      section "The app on your phone" $ bullets $ do
+        bullet "It keeps the timings and Azan recordings of the mosques you follow on the phone, so the Azan sounds without internet."
+        bullet "It sends nothing beyond what the website does. It has no analytics, no ads, and no trackers, and uses no Google services."
+        bullet "Uninstalling it removes everything it kept."
+
+      section "Who else handles your data" $ bullets $ do
+        bullet "Brevo sends the sign-in emails, so it receives your email address."
+        bullet "Hostinger runs the server Hilal lives on."
+        bullet "OpenStreetMap's Nominatim receives a mosque's public address when it is added, to find where it is; nothing about you."
+        bullet "Links to Google Maps open Google Maps, under Google's own privacy policy."
+
+      section "How long" $ bullets $ do
+        bullet "Your account, until you delete it."
+        bullet "Copies of Hilal's data are made whenever Hilal is updated, in case the server fails. A deleted account remains in those copies until they are replaced by newer ones."
+
+      section "Deleting your account" $
+        p_ $ do
+          "Go to Account, then "
+          a_ [href_ "/account/delete", class_ "link link-accent"] "Delete account"
+          ". Your email, your follows and your sign-ins are deleted at once. "
+          "Records of your edits stay, without anything that leads back to you. "
+          "If you can't sign in, write to the address above."
+  where
+    section :: Text -> Html () -> Html ()
+    section title body = div_ $ do
+      h2_ [class_ "mb-1 font-semibold"] (toHtml title)
+      body
+    bullets :: Html () -> Html ()
+    bullets = ul_ [class_ "list-disc space-y-1 pl-5"]
+    bullet :: Html () -> Html ()
+    bullet = li_
 
 -- Without a location or a search, the page asks for one instead of listing every mosque.
 mosquesPage :: Text -> Maybe Coords -> [(Mosque, Maybe Double)] -> Bool -> Html ()

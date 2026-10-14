@@ -65,6 +65,7 @@ import Hilal.Query
   , createMosque
   , deleteExpired
   , deleteSignInCode
+  , deleteUser
   , findOrCreateUser
   , followMosque
   , followedMosques
@@ -91,15 +92,18 @@ import Hilal.Time (lookupZone, nextJamaat, upcomingToday)
 import Hilal.Types (Coords (..), Mosque (..), MosqueId (..), Prayer, PrayerTime, User (..), hasAllTimings, mosqueCoords, prayerToText)
 import Hilal.Views
   ( FollowState (..)
+  , accountDeletedPage
   , accountPage
   , addLinkPage
   , codePage
+  , deleteAccountPage
   , homePage
   , mosqueFormPage
   , mosquePage
   , mosqueUrl
   , mosquesPage
   , notFoundPage
+  , privacyPage
   , signInPage
   , signInUrl
   , stylesheet
@@ -278,7 +282,7 @@ app cfg = scottyApp $ do
   get "/api/v1/mosques/:id/timings" $ do
     found <- loadMosque dbPath =<< pathParam "id"
     case found of
-      Just (m, timings, _) | hasAllTimings timings ->
+      Just (m, timings, _) | hasAllTimings timings -> do
         recordings <- liftIO (mosqueRecordings (configAzanDir cfg) (mosqueId m))
         etagResponse "application/json; charset=utf-8" (timingsJson m recordings timings)
       _ -> apiNotFound
@@ -399,6 +403,20 @@ app cfg = scottyApp $ do
   get "/account" $
     requireUser dbPath "/account" $ \u ->
       page (accountPage (userEmail u) (userEmail u == configSuperadmin cfg))
+
+  get "/account/delete" $
+    requireUser dbPath "/account/delete" $ \u ->
+      page (deleteAccountPage (userEmail u))
+
+  -- The phone notices at its next sync, which then finds itself signed out and clears its alarms.
+  post "/account/delete" $ sameOriginOnly $
+    requireUser dbPath "/account/delete" $ \u -> do
+      liftIO $ withDb dbPath $ \conn -> deleteUser conn (userId u) (userEmail u)
+      setCookieHeader (clearSessionCookie (configSecureCookies cfg))
+      page accountDeletedPage
+
+  get "/privacy" $
+    page privacyPage
 
   notFound notFoundResponse
   where

@@ -55,6 +55,7 @@ import Hilal.Query
   , createMosque
   , deleteExpired
   , deleteSignInCode
+  , deleteUser
   , findOrCreateUser
   , followMosque
   , followedMosques
@@ -1018,6 +1019,24 @@ main = hspec $ do
       withTestDb $ \conn ->
         isBlocked conn "nobody@example.com" `shouldReturn` False
 
+    it "lose their sessions, follows and email when deleted" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        makeSession conn noon later (userId user) "token-hash"
+        followMosque conn noon (userId user) (MosqueId 2)
+        deleteUser conn (userId user) "reader@example.com"
+        getSessionUser conn noon "token-hash" `shouldReturn` Nothing
+        followedMosques conn (userId user) `shouldReturn` []
+        let UserId n = userId user
+        isBlocked conn ("deleted:" <> T.pack (show n)) `shouldReturn` True
+
+    it "keep their id to themselves once deleted, so the edit log never names someone else" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        deleteUser conn (userId user) "reader@example.com"
+        again <- findOrCreateUser conn later "reader@example.com"
+        userId again `shouldNotBe` userId user
+
   describe "sessions" $ do
     it "identify their user" $
       withTestDb $ \conn -> do
@@ -1291,6 +1310,34 @@ main = hspec $ do
         cookie <- signIn
         request "GET" "/account" [("Cookie", cookie)] "" `shouldRespondWith` 200
 
+    describe "deleting your account" $ do
+      it "asks you to sign in first, then returns" $
+        get "/account/delete" `shouldRespondWith` 302
+          { matchHeaders = ["Location" <:> "/sign-in?next=%2Faccount%2Fdelete"] }
+
+      it "asks you to confirm" $ do
+        cookie <- signIn
+        request "GET" "/account/delete" [("Cookie", cookie)] "" `shouldRespondWith` 200
+
+      it "signs you out everywhere and forgets your follows" $ do
+        cookie <- signIn
+        postForm "/mosques/2/follow" [("Cookie", cookie)] "" `shouldRespondWith` 302
+        postForm "/account/delete" [("Cookie", cookie)] "" `shouldRespondWith` 200
+        request "GET" "/api/v1/me/mosques" [("Cookie", cookie)] "" `shouldRespondWith` 401
+        again <- signIn
+        home <- homeBody again
+        liftIO (home `shouldSatisfy` (not . BS.isInfixOf "Sultan Ahmed Mosque"))
+
+      it "rejects posts from another site" $ do
+        cookie <- signIn
+        postForm "/account/delete" [("Cookie", cookie), ("Origin", "https://evil.example"), ("Host", "localhost")] ""
+          `shouldRespondWith` 403
+        request "GET" "/account" [("Cookie", cookie)] "" `shouldRespondWith` 200
+
+    describe "the privacy page" $
+      it "is shown to everyone" $
+        get "/privacy" `shouldRespondWith` 200
+
     describe "sign-out" $
       it "ends the session" $ do
         cookie <- signIn
@@ -1518,9 +1565,9 @@ main = hspec $ do
           Just etag ->
             request "GET" "/mosques/2/azan" [("If-None-Match", etag)] "" `shouldRespondWith` 304
 
-      it "keep Fajr's own recording apart" $ do
+      it "use the mosque's own Azan for Fajr until it has a Fajr Azan" $ do
         addRecording "2.ogg" "OggS recording"
-        get "/mosques/2/azan-fajr" `shouldRespondWith` 404
+        get "/mosques/2/azan-fajr" `shouldRespondWith` "OggS recording"
         addRecording "2-fajr.m4a" "fajr recording"
         get "/mosques/2/azan-fajr" `shouldRespondWith` "fajr recording"
           { matchHeaders = ["Content-Type" <:> "audio/mp4"] }
@@ -1535,3 +1582,19 @@ main = hspec $ do
 
       it "are 404 for an id that isn't a number" $
         get "/mosques/abc/azan" `shouldRespondWith` 404
+
+      it "fall back to Hilal's default, mosque 0's, for a mosque without its own" $ do
+        addRecording "0.mp3" "ID3 default"
+        addRecording "0-fajr.mp3" "ID3 default fajr"
+        get "/mosques/2/azan" `shouldRespondWith` "ID3 default"
+          { matchHeaders = ["Content-Type" <:> "audio/mpeg"] }
+        get "/mosques/2/azan-fajr" `shouldRespondWith` "ID3 default fajr"
+        db <- stateDb <$> getState
+        found <- liftIO (mosqueRecordings (db <> "-azan") (MosqueId 2))
+        liftIO (found `shouldBe` [Azan, FajrAzan])
+
+      it "prefer the mosque's own to the default" $ do
+        addRecording "0.mp3" "ID3 default"
+        addRecording "2.ogg" "OggS recording"
+        get "/mosques/2/azan" `shouldRespondWith` "OggS recording"
+        get "/mosques/2/azan-fajr" `shouldRespondWith` "OggS recording"
