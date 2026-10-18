@@ -7,7 +7,9 @@ module Hilal.Edit
   , changedTimings
   , creationLog
   , editLog
+  , maintainerLog
   , logLine
+  , blockLogLine
   ) where
 
 import Data.Either (lefts, rights)
@@ -98,6 +100,12 @@ logLine :: UTCTime -> UserId -> MosqueId -> Text -> Text
 logLine now (UserId u) (MosqueId m) change =
   formatTimestamp now <> " user=" <> T.pack (show u) <> " mosque=" <> T.pack (show m) <> " " <> change
 
+-- The superadmin blocking or unblocking an account, which concerns no mosque.
+blockLogLine :: UTCTime -> UserId -> UserId -> Bool -> Text
+blockLogLine now (UserId admin) target blocked =
+  formatTimestamp now <> " user=" <> T.pack (show admin) <> " "
+    <> (if blocked then "blocked " else "unblocked ") <> account target
+
 creationLog :: ValidMosque -> Place -> Coords -> [Text]
 creationLog v p (Coords lat lng) =
   ( "created name=" <> quoted (validName v)
@@ -123,6 +131,15 @@ editLog m old v =
       | otherwise       = Just (key <> ": " <> quoted before <> " -> " <> quoted after)
     timingChange (p, t) =
       prayerToText p <> ": " <> maybe "unset" times (lookup p old) <> " -> " <> times t
+
+-- A mosque's maintainer changing, by account number, never by email.
+maintainerLog :: Maybe UserId -> Maybe UserId -> Text
+maintainerLog before after = "maintainer: " <> who before <> " -> " <> who after
+  where
+    who = maybe "none" account
+
+account :: UserId -> Text
+account (UserId n) = "user=" <> T.pack (show n)
 
 times :: PrayerTime -> Text
 times t = formatClock (ptAzan t) <> "/" <> formatClock (ptJamaat t)

@@ -1,10 +1,13 @@
 module Hilal.Views
   ( FollowState (..)
+  , Editing (..)
   , homePage
   , mosquePage
   , mosquesPage
   , mosqueFormPage
   , addLinkPage
+  , notAllowedPage
+  , usersPage
   , mosqueUrl
   , signInUrl
   , notFoundPage
@@ -42,13 +45,23 @@ import Hilal.Types
   , MosqueId (..)
   , Prayer (..)
   , PrayerTime (..)
+  , User (..)
+  , UserId (..)
   , formatTimestamp
+  , isDeleted
   , prayerLabel
   , prayerToText
   , prayerUrdu
   )
 
 data FollowState = SignedOut | NotFollowing | Following
+  deriving (Show, Eq)
+
+-- What the viewer of a mosque's page may do about its timings.
+data Editing
+  = Reporter Text                -- report them, by email to this address: the superadmin's
+  | Maintainer                   -- edit them, as the mosque's maintainer
+  | Superadmin (Maybe Text) [Text] -- edit them, and choose the maintainer: theirs, and what went wrong choosing
   deriving (Show, Eq)
 
 -- Which tab of the bottom bar is highlighted.
@@ -167,6 +180,17 @@ mosqueUrl (MosqueId n) = "/mosques/" <> T.pack (show n)
 
 signInUrl :: Text -> Text
 signInUrl next = "/sign-in?next=" <> decodeUtf8 (urlEncode True (encodeUtf8 next))
+
+-- An email to the superadmin, from the person's own email app, naming the mosque.
+-- Nothing passes through Hilal, so nothing about the person is kept.
+reportLink :: Text -> Mosque -> Text
+reportLink address m =
+  "mailto:" <> address <> "?subject=" <> encode subject <> "&body=" <> encode body
+  where
+    MosqueId n = mosqueId m
+    subject = "Hilal: mosque " <> T.pack (show n) <> ", " <> mosqueName m
+    body = "Which timings are wrong, and what are they now?\n\n"
+    encode = decodeUtf8 . urlEncode True . encodeUtf8
 
 -- One line for lists: "Asr Jamaat عصر at 4:15 PM · in 2 h 15 min".
 nextLine :: NextJamaat -> Html ()
@@ -310,14 +334,27 @@ codePage email next message =
     a_ [href_ "/sign-in", class_ "link link-accent mt-4 inline-block text-sm"]
       "Use a different email or get a new code"
 
-accountPage :: Text -> Bool -> Html ()
-accountPage email superadmin =
+-- The mosques listed are those the person maintains, which only they and the superadmin see.
+accountPage :: Text -> Bool -> [Mosque] -> Html ()
+accountPage email superadmin maintained =
   layout "Account · Hilal" AccountTab (bandTitle "Account") $ do
     div_ [class_ "mb-4 rounded-box border border-base-300 bg-base-100 p-4"] $ do
       p_ [class_ "text-sm text-base-content/70"] "Signed in as"
       p_ [class_ "break-all font-semibold"] (toHtml email)
-      when superadmin $
+      when superadmin $ do
         span_ [class_ "badge badge-secondary badge-sm mt-2"] "Superadmin"
+        p_ [class_ "mt-3 text-sm"] $
+          a_ [href_ "/admin/users", class_ "link link-accent"] "Manage users"
+    unless (null maintained) $ do
+      p_ [class_ "mb-2 text-sm text-base-content/70"] "You maintain"
+      ul_ [class_ (listClasses <> " mb-4")] $
+        forM_ maintained $ \m ->
+          li_ $
+            a_ [href_ (mosqueUrl (mosqueId m)), class_ "flex items-center gap-3 px-4 py-3 active:bg-base-200"] $ do
+              div_ [class_ "min-w-0 flex-1"] $ do
+                div_ [class_ "truncate font-semibold"] (toHtml (mosqueName m))
+                div_ [class_ "truncate text-sm text-base-content/70"] (toHtml (mosqueAddress m))
+              chevron
     form_ [method_ "post", action_ "/sign-out"] $
       button_ [type_ "submit", class_ "btn btn-outline w-full"] "Sign out"
     div_ [class_ "mt-6 flex justify-between text-sm"] $ do
@@ -352,11 +389,67 @@ accountDeletedPage =
     p_ [class_ "mb-4"] "Your account is deleted. Thank you for using Hilal."
     a_ [href_ "/mosques", class_ "link link-accent"] "Browse mosques"
 
+-- The superadmin's page for finding an account, by email or by the number in edits.log,
+-- and blocking or unblocking it.
+usersPage :: Text -> Text -> Maybe (User, Bool, [Mosque]) -> Html ()
+usersPage superadmin q found =
+  layout "Users · Hilal" AccountTab (bandTitle "Users") $ do
+    form_ [method_ "get", action_ "/admin/users", role_ "search", class_ "join mb-4 w-full"] $ do
+      input_
+        [ type_ "search"
+        , name_ "q"
+        , value_ q
+        , required_ ""
+        , placeholder_ "Email or account number"
+        , makeAttributes "aria-label" "Email or account number"
+        , class_ "input join-item w-full"
+        ]
+      button_ [type_ "submit", class_ "btn btn-primary join-item"] "Find"
+    case found of
+      Nothing
+        | T.null q  -> p_ [class_ "text-base-content/70"] "Find an account by its email, or by its number in edits.log."
+        | otherwise -> p_ [class_ "text-base-content/70"] $ do
+            "No account matches \""
+            toHtml q
+            "\"."
+      Just (u, blocked, maintained) -> account u blocked maintained
+    a_ [href_ "/account", class_ "link link-accent mt-6 inline-block text-sm"] "Back to Account"
+  where
+    account u blocked maintained = do
+      let UserId n = userId u
+          url = "/admin/users/" <> T.pack (show n)
+      div_ [class_ "flex flex-col gap-2 rounded-box border border-base-300 bg-base-100 p-4"] $ do
+        p_ [class_ "break-all font-semibold"] $
+          if isDeleted u then "Deleted account" else toHtml (userEmail u)
+        p_ [class_ "text-sm text-base-content/70"] $ do
+          toHtml ("Account " <> T.pack (show n) <> " · ")
+          if blocked then "Blocked" else "Active"
+        unless (null maintained) $ do
+          p_ [class_ "text-sm text-base-content/70"] "Maintains"
+          ul_ [class_ "list-disc pl-5"] $
+            forM_ maintained $ \m ->
+              li_ $ a_ [href_ (mosqueUrl (mosqueId m)), class_ "link link-accent"] (toHtml (mosqueName m))
+        blockButton u blocked url
+    -- Never for the superadmin, nor to unblock a deleted account, whose email is gone.
+    blockButton u blocked url
+      | userEmail u == superadmin =
+          p_ [class_ "text-sm text-base-content/70"] "This is you."
+      | isDeleted u =
+          return ()
+      | blocked =
+          form_ [method_ "post", action_ (url <> "/unblock")] $
+            button_ [type_ "submit", class_ "btn btn-outline w-full"] "Unblock"
+      | otherwise =
+          form_ [method_ "post", action_ (url <> "/block")] $ do
+            p_ [class_ "mb-2 text-sm text-base-content/70"]
+              "Blocking signs them out everywhere and removes them as maintainer; their email can't sign in again."
+            button_ [type_ "submit", class_ "btn btn-error w-full"] "Block"
+
 privacyPage :: Html ()
 privacyPage =
   layout "Privacy · Hilal" NoTab (bandTitle "Privacy") $
     div_ [class_ "flex flex-col gap-4 rounded-box border border-base-300 bg-base-100 p-4 leading-relaxed"] $ do
-      p_ [class_ "text-sm text-base-content/70"] "Last updated 13 October 2026"
+      p_ [class_ "text-sm text-base-content/70"] "Last updated 18 October 2026"
       p_ $ do
         "Hilal tells you the Azan and Jamaat times of the mosques you follow. "
         "It is run by Irfan Ali, who you can write to at "
@@ -366,13 +459,17 @@ privacyPage =
       section "What Hilal keeps" $ bullets $ do
         bullet "Your email address, so you can sign in."
         bullet "The mosques you follow, so Hilal can show their times and the app can sound their Azan. No one else can see them."
+        bullet "If you look after a mosque's timings for Hilal, which mosque. Only you and Hilal's superadmin can see it."
         bullet $ do
-          "A record of each mosque you add and each change you make, so vandalism can be found and undone. "
+          "A record of each mosque you add and each change you make, so mistakes and vandalism can be found and undone. "
           "It names your account by number, not by email, and never shows anyone who made a change."
         bullet $ do
           "While you sign in: the code we email you, stored scrambled, for 10 minutes; "
           "and the codes sent and wrong codes tried, for a day, to stop abuse."
         bullet "A cookie that keeps you signed in, for up to a year. Hilal sets no other cookies."
+        bullet $ do
+          "Nothing when you report wrong timings: Report opens your own email app, "
+          "and your email reaches Hilal's superadmin from your address, like any other."
 
       section "Your location" $ bullets $ do
         bullet $ do
@@ -399,7 +496,7 @@ privacyPage =
         p_ $ do
           "Go to Account, then "
           a_ [href_ "/account/delete", class_ "link link-accent"] "Delete account"
-          ". Your email, your follows and your sign-ins are deleted at once. "
+          ". Your email, your follows, your sign-ins, and any mosque you look after are removed at once. "
           "Records of your edits stay, without anything that leads back to you. "
           "If you can't sign in, write to the address above."
   where
@@ -553,6 +650,7 @@ showDouble = T.pack . show
 -- The timings table fits a 320 px screen: Urdu goes under the English, cells are
 -- narrower on phones, and the box scrolls rather than cutting a column off.
 -- The next prayer's row is highlighted and framed in gold, like the gold card above.
+-- Edit appears only for those who may edit; everyone else is offered Report instead.
 mosquePage
   :: Mosque
   -> [(Prayer, PrayerTime)]
@@ -560,8 +658,9 @@ mosquePage
   -> Maybe NextJamaat
   -> Maybe Day
   -> Maybe FollowState
+  -> Editing
   -> Html ()
-mosquePage mosque timings now next updated followState =
+mosquePage mosque timings now next updated followState editing =
   layout (mosqueName mosque <> " · Prayer times") NoTab band $ do
     forM_ next nextCard
     div_ [class_ "overflow-x-auto rounded-box border border-base-300 bg-base-100"] $
@@ -575,6 +674,15 @@ mosquePage mosque timings now next updated followState =
           mapM_ row [minBound .. maxBound :: Prayer]
     forM_ updated $ \d ->
       p_ [class_ "mt-4 text-sm text-base-content/60"] (toHtml ("Updated " <> shortDate d))
+    case editing of
+      Reporter address ->
+        p_ [class_ "mt-2 text-sm text-base-content/70"] $ do
+          "Timings wrong or out of date? "
+          a_ [href_ (reportLink address mosque), class_ "link link-accent"] "Report them"
+      Maintainer ->
+        p_ [class_ "mt-2 text-sm text-base-content/70"] "You maintain this mosque, so you can edit its timings."
+      Superadmin maintainer problems ->
+        maintainerPanel (mosqueId mosque) maintainer problems
     when (isJust next) countdownScript
   where
     band =
@@ -590,7 +698,9 @@ mosquePage mosque timings now next updated followState =
                 hijriHtml parts
         div_ [class_ "flex shrink-0 flex-col items-end gap-2"] $ do
           forM_ followState (followButton (mosqueId mosque))
-          a_ [href_ (mosqueUrl (mosqueId mosque) <> "/edit"), class_ "btn btn-ghost btn-sm text-primary-content"] "Edit"
+          case editing of
+            Reporter _ -> return ()
+            _ -> a_ [href_ (mosqueUrl (mosqueId mosque) <> "/edit"), class_ "btn btn-ghost btn-sm text-primary-content"] "Edit"
     nextPrayerOnly = njPrayer <$> next
     nextCard n =
       div_ [class_ "mb-4 rounded-box border-2 border-secondary bg-base-100 p-4 text-center"] $ do
@@ -620,6 +730,34 @@ mosquePage mosque timings now next updated followState =
           Nothing ->
             td_ [colspan_ "2", class_ "px-2 text-base-content/60 sm:px-4"] "Not set"
 
+-- Only the superadmin sees this: who maintains the mosque, to remove them, or a field to choose someone.
+maintainerPanel :: MosqueId -> Maybe Text -> [Text] -> Html ()
+maintainerPanel mid maintainer problems =
+  div_ [class_ "mt-6 rounded-box border border-base-300 bg-base-100 p-4"] $ do
+    h2_ [class_ "mb-2 font-semibold"] "Maintainer"
+    errorList problems
+    case maintainer of
+      Just email ->
+        div_ [class_ "flex items-center justify-between gap-3"] $ do
+          span_ [class_ "min-w-0 break-all"] (toHtml email)
+          form_ [method_ "post", action_ (url <> "/maintainer/remove")] $
+            button_ [type_ "submit", class_ "btn btn-outline btn-sm"] "Remove"
+      Nothing -> do
+        p_ [class_ "mb-2 text-sm text-base-content/70"] "None, so only you can edit this mosque."
+        form_ [method_ "post", action_ (url <> "/maintainer"), class_ "join w-full"] $ do
+          input_
+            [ type_ "email"
+            , name_ "email"
+            , required_ ""
+            , placeholder_ "Their email, as they sign in"
+            , makeAttributes "aria-label" "Maintainer's email"
+            , class_ "input join-item w-full"
+            ]
+          button_ [type_ "submit", class_ "btn btn-primary join-item"] "Assign"
+    p_ [class_ "mt-2 text-xs text-base-content/60"] "Only you see this."
+  where
+    url = mosqueUrl mid
+
 followButton :: MosqueId -> FollowState -> Html ()
 followButton mid state = case state of
   SignedOut ->
@@ -643,6 +781,15 @@ errorList errors =
   unless (null errors) $
     div_ [role_ "alert", class_ "alert alert-error mb-4"] $
       ul_ [class_ "list-disc pl-4"] (mapM_ (li_ . toHtml) errors)
+
+-- For someone signed in who may not edit the mosque.
+notAllowedPage :: Mosque -> Html ()
+notAllowedPage m =
+  layout ("Edit " <> mosqueName m <> " · Hilal") NoTab (bandTitle ("Edit " <> mosqueName m)) $ do
+    p_ [class_ "mb-4 text-base-content/70"] $ do
+      "Only Hilal's superadmin and this mosque's maintainer can change its timings. "
+      "If they're wrong or out of date, please report them from the mosque's page."
+    a_ [href_ (mosqueUrl (mosqueId m)), class_ "btn btn-primary"] "Back to the mosque"
 
 -- Adding starts with the mosque's Google Maps link, which gives its name and location.
 addLinkPage :: Text -> [Text] -> Maybe MosqueId -> Html ()
@@ -727,6 +874,9 @@ mosqueFormPage title action errors form upcoming adding =
             "Jamaat "
             urdu "text-accent" "جماعت"
         mapM_ prayerRow (formTimes form)
+      when adding $
+        p_ [class_ "text-sm text-base-content/70"]
+          "Once it's added, only Hilal's superadmin, or a maintainer they choose, can change this mosque, so please check the timings before saving."
       button_ [type_ "submit", class_ "btn btn-primary"] "Save"
     when (adding && null errors) $
       script_ [] (toHtmlRaw timezoneScript)

@@ -16,6 +16,7 @@ module Hilal.Types
   , mosqueCoords
   , UserId (..)
   , User (..)
+  , isDeleted
   , SignInCode (..)
   ) where
 
@@ -153,6 +154,10 @@ data User = User
 
 instance FromRow User where
   fromRow = User <$> field <*> field
+
+-- A deleted account keeps its row, with its email replaced by "deleted:<id>"; see `deleteUser`.
+isDeleted :: User -> Bool
+isDeleted u = "deleted:" `T.isPrefixOf` userEmail u
 
 data SignInCode = SignInCode
   { codeHash      :: Text

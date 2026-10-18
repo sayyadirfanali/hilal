@@ -1,7 +1,7 @@
 module Hilal.App (Config (..), app) where
 
 import Control.Exception (SomeException, try)
-import Control.Monad (forM, forM_, when)
+import Control.Monad (forM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
@@ -14,7 +14,7 @@ import Data.Text.Lazy qualified as TL
 import Data.Text.Read (decimal)
 import Data.Time (LocalTime, UTCTime, addUTCTime, getCurrentTime, localDay)
 import Data.Time.Zones (utcToLocalTimeTZ)
-import Database.SQLite.Simple (withTransaction)
+import Database.SQLite.Simple (Connection, withTransaction)
 import Lucid (Html, renderText)
 import Network.HTTP.Types.Status (status304, status400, status401, status403, status404, status429, status503)
 import Network.HTTP.Types.URI (urlEncode)
@@ -48,18 +48,21 @@ import Hilal.DB (withDb)
 import Hilal.Edit
   ( MosqueForm (..)
   , ValidMosque (..)
+  , blockLogLine
   , changedTimings
   , creationLog
   , editLog
   , emptyForm
   , formFromMosque
   , logLine
+  , maintainerLog
   , validateForm
   )
 import Hilal.JSON (followedJson, notFoundJson, notSignedInJson, timingsJson)
 import Hilal.Location (Place (..), coordsFromParams, distanceMeters, isMosqueName, locatePlace, placeLink, placePin)
 import Hilal.Query
-  ( clearWrongCodes
+  ( blockUser
+  , clearWrongCodes
   , countSentCodes
   , countWrongCodes
   , createMosque
@@ -70,6 +73,7 @@ import Hilal.Query
   , followMosque
   , followedMosques
   , getLastUpdated
+  , getMaintainer
   , getMosque
   , getSessionUser
   , getSignInCode
@@ -78,6 +82,7 @@ import Hilal.Query
   , isBlocked
   , isFollowing
   , killSession
+  , maintainedMosques
   , makeSession
   , mosqueByPlace
   , recordSentCode
@@ -85,13 +90,30 @@ import Hilal.Query
   , saveSignInCode
   , saveTiming
   , searchMosques
+  , setMaintainer
+  , unblockUser
   , unfollowMosque
   , updateMosque
+  , userByEmail
+  , userById
   )
 import Hilal.Time (lookupZone, nextJamaat, upcomingToday)
-import Hilal.Types (Coords (..), Mosque (..), MosqueId (..), Prayer, PrayerTime, User (..), hasAllTimings, mosqueCoords, prayerToText)
+import Hilal.Types
+  ( Coords (..)
+  , Mosque (..)
+  , MosqueId (..)
+  , Prayer
+  , PrayerTime
+  , User (..)
+  , UserId (..)
+  , hasAllTimings
+  , isDeleted
+  , mosqueCoords
+  , prayerToText
+  )
 import Hilal.Views
-  ( FollowState (..)
+  ( Editing (..)
+  , FollowState (..)
   , accountDeletedPage
   , accountPage
   , addLinkPage
@@ -102,11 +124,13 @@ import Hilal.Views
   , mosquePage
   , mosqueUrl
   , mosquesPage
+  , notAllowedPage
   , notFoundPage
   , privacyPage
   , signInPage
   , signInUrl
   , stylesheet
+  , usersPage
   )
 
 data Config = Config
@@ -124,6 +148,8 @@ data Config = Config
 data SendOutcome = CodeSent | CodeTooSoon | TooManyCodes | TooManyWrongCodes | SendFailed | EmailBlocked
 
 data FollowAction = Follow | Unfollow
+
+type LoadedMosque = (Mosque, [(Prayer, PrayerTime)], Maybe UTCTime)
 
 app :: Config -> IO Application
 app cfg = scottyApp $ do
@@ -198,6 +224,7 @@ app cfg = scottyApp $ do
           page (mosqueFormPage "Add a mosque" "/mosques/new" [] (placeForm place pin emptyForm) [] True)
 
   -- The link is read and checked again, so the name and location can't be swapped on the way.
+  -- Whoever adds the mosque doesn't become its maintainer; the superadmin chooses one.
   post "/mosques/new" $ sameOriginOnly $
     requireUser dbPath "/mosques/new" $ \user -> do
       submitted <- readMosqueForm
@@ -227,20 +254,9 @@ app cfg = scottyApp $ do
     found <- loadMosque dbPath =<< pathParam "id"
     case found of
       Nothing -> notFoundResponse
-      Just (m, timings, updated) -> do
-        now <- liftIO getCurrentTime
+      Just loaded -> do
         user <- currentUser dbPath
-        following <- case user of
-          Nothing -> return SignedOut
-          Just u -> do
-            yes <- liftIO $ withDb dbPath $ \conn -> isFollowing conn (userId u) (mosqueId m)
-            return (if yes then Following else NotFollowing)
-        let zone        = lookupZone (mosqueTimezone m)
-            localNow    = (`utcToLocalTimeTZ` now) <$> zone
-            coming      = zone >>= \z -> nextJamaat z now timings
-            updatedDay  = localDay <$> (utcToLocalTimeTZ <$> zone <*> updated)
-            followState = if hasAllTimings timings then Just following else Nothing
-        page (mosquePage m timings localNow coming updatedDay followState)
+        showMosque cfg loaded user []
 
   post "/mosques/:id/follow" $ sameOriginOnly $
     changeFollow dbPath Follow =<< pathParam "id"
@@ -253,7 +269,7 @@ app cfg = scottyApp $ do
     case found of
       Nothing -> notFoundResponse
       Just (m, timings, _) ->
-        requireUser dbPath (editUrl m) $ \_ -> do
+        requireEditor cfg m $ \_ -> do
           upcoming <- upcomingFor m timings
           page (mosqueFormPage (editTitle m) (editUrl m) [] (formFromMosque m timings) upcoming False)
 
@@ -262,7 +278,7 @@ app cfg = scottyApp $ do
     case found of
       Nothing -> notFoundResponse
       Just (m, oldTimings, _) ->
-        requireUser dbPath (editUrl m) $ \user -> do
+        requireEditor cfg m $ \user -> do
           -- The name stays as Google Maps had it when the mosque was added.
           form <- (\f -> f { formName = mosqueName m }) <$> readMosqueForm
           case validateForm form of
@@ -278,6 +294,53 @@ app cfg = scottyApp $ do
                 forM_ (changedTimings oldTimings (validTimings valid)) $ uncurry (saveTiming conn now mid)
               liftIO $ mapM_ (configLogEdit cfg . logLine now (userId user) mid) (editLog m oldTimings valid)
               redirect (TL.fromStrict (mosqueUrl mid))
+
+  -- Only the superadmin chooses a mosque's maintainer, who must have signed in at least once.
+  post "/mosques/:id/maintainer" $ sameOriginOnly $ do
+    found <- loadMosque dbPath =<< pathParam "id"
+    case found of
+      Nothing -> notFoundResponse
+      Just loaded@(m, _, _) ->
+        requireSuperadmin cfg (mosqueUrl (mosqueId m)) $ \admin -> do
+          input <- textParam "email"
+          result <- liftIO $ withDb dbPath $ \conn ->
+            case normaliseEmail input of
+              Nothing -> return (Left "Please enter a valid email address.")
+              Just email -> do
+                account <- userByEmail conn email
+                case account of
+                  Nothing ->
+                    return (Left "No one has signed in to Hilal with that email yet. Ask them to sign in once, then try again.")
+                  Just (u, blocked)
+                    | blocked                         -> return (Left "That account is blocked.")
+                    | email == configSuperadmin cfg -> return (Left "You can already edit every mosque.")
+                    | otherwise -> do
+                        old <- getMaintainer conn (mosqueId m)
+                        setMaintainer conn (mosqueId m) (Just (userId u))
+                        return (Right (userId <$> old, userId u))
+          case result of
+            Left problem ->
+              showMosque cfg loaded (Just admin) [problem]
+            Right (old, new) -> do
+              now <- liftIO getCurrentTime
+              liftIO $ configLogEdit cfg (logLine now (userId admin) (mosqueId m) (maintainerLog old (Just new)))
+              redirect (TL.fromStrict (mosqueUrl (mosqueId m)))
+
+  post "/mosques/:id/maintainer/remove" $ sameOriginOnly $ do
+    found <- loadMosque dbPath =<< pathParam "id"
+    case found of
+      Nothing -> notFoundResponse
+      Just (m, _, _) -> do
+        let mid = mosqueId m
+        requireSuperadmin cfg (mosqueUrl mid) $ \admin -> do
+          old <- liftIO $ withDb dbPath $ \conn -> do
+            old <- getMaintainer conn mid
+            setMaintainer conn mid Nothing
+            return old
+          forM_ old $ \u -> do
+            now <- liftIO getCurrentTime
+            liftIO $ configLogEdit cfg (logLine now (userId admin) mid (maintainerLog (Just (userId u)) Nothing))
+          redirect (TL.fromStrict (mosqueUrl mid))
 
   get "/api/v1/mosques/:id/timings" $ do
     found <- loadMosque dbPath =<< pathParam "id"
@@ -401,8 +464,9 @@ app cfg = scottyApp $ do
     redirect "/mosques"
 
   get "/account" $
-    requireUser dbPath "/account" $ \u ->
-      page (accountPage (userEmail u) (userEmail u == configSuperadmin cfg))
+    requireUser dbPath "/account" $ \u -> do
+      maintained <- liftIO $ withDb dbPath $ \conn -> maintainedMosques conn (userId u)
+      page (accountPage (userEmail u) (isSuperadmin cfg u) maintained)
 
   get "/account/delete" $
     requireUser dbPath "/account/delete" $ \u ->
@@ -414,6 +478,19 @@ app cfg = scottyApp $ do
       liftIO $ withDb dbPath $ \conn -> deleteUser conn (userId u) (userEmail u)
       setCookieHeader (clearSessionCookie (configSecureCookies cfg))
       page accountDeletedPage
+
+  -- The superadmin finds an account by email, or by the number edits.log gives it.
+  get "/admin/users" $
+    requireSuperadmin cfg "/admin/users" $ \_ -> do
+      q <- maybe "" T.strip <$> queryParamMaybe "q"
+      found <- liftIO $ withDb dbPath $ \conn -> findAccount conn q
+      page (usersPage (configSuperadmin cfg) q found)
+
+  post "/admin/users/:id/block" $ sameOriginOnly $
+    changeBlock cfg True =<< pathParam "id"
+
+  post "/admin/users/:id/unblock" $ sameOriginOnly $
+    changeBlock cfg False =<< pathParam "id"
 
   get "/privacy" $
     page privacyPage
@@ -479,6 +556,93 @@ addUrl shared
   | T.null shared = "/mosques/new"
   | otherwise     = "/mosques/new?location=" <> TE.decodeUtf8 (urlEncode True (TE.encodeUtf8 shared))
 
+-- The mosque's page, for whoever is looking; problems are from the superadmin choosing a maintainer.
+showMosque :: Config -> LoadedMosque -> Maybe User -> [Text] -> ActionM ()
+showMosque cfg (m, timings, updated) user problems = do
+  now <- liftIO getCurrentTime
+  (following, maintainer) <- liftIO $ withDb (configDb cfg) $ \conn -> do
+    maintainer <- getMaintainer conn (mosqueId m)
+    following <- case user of
+      Nothing -> return SignedOut
+      Just u -> do
+        yes <- isFollowing conn (userId u) (mosqueId m)
+        return (if yes then Following else NotFollowing)
+    return (following, maintainer)
+  let zone        = lookupZone (mosqueTimezone m)
+      localNow    = (`utcToLocalTimeTZ` now) <$> zone
+      coming      = zone >>= \z -> nextJamaat z now timings
+      updatedDay  = localDay <$> (utcToLocalTimeTZ <$> zone <*> updated)
+      followState = if hasAllTimings timings then Just following else Nothing
+  unless (null problems) $
+    status status400
+  page (mosquePage m timings localNow coming updatedDay followState (editingFor cfg user maintainer problems))
+
+editingFor :: Config -> Maybe User -> Maybe User -> [Text] -> Editing
+editingFor cfg viewer maintainer problems = case viewer of
+  Just v
+    | isSuperadmin cfg v                         -> Superadmin (userEmail <$> maintainer) problems
+    | (userId <$> maintainer) == Just (userId v) -> Maintainer
+  _ -> Reporter (configSuperadmin cfg)
+
+isSuperadmin :: Config -> User -> Bool
+isSuperadmin cfg u = userEmail u == configSuperadmin cfg
+
+-- Only the superadmin and the mosque's maintainer may edit it.
+mayEdit :: Config -> User -> MosqueId -> IO Bool
+mayEdit cfg u mid
+  | isSuperadmin cfg u = return True
+  | otherwise = do
+      maintainer <- withDb (configDb cfg) $ \conn -> getMaintainer conn mid
+      return ((userId <$> maintainer) == Just (userId u))
+
+requireEditor :: Config -> Mosque -> (User -> ActionM ()) -> ActionM ()
+requireEditor cfg m action =
+  requireUser (configDb cfg) (editUrl m) $ \u -> do
+    allowed <- liftIO (mayEdit cfg u (mosqueId m))
+    if allowed
+      then action u
+      else do
+        status status403
+        page (notAllowedPage m)
+
+-- Everyone else is told there's nothing here, as for any unknown address.
+requireSuperadmin :: Config -> Text -> (User -> ActionM ()) -> ActionM ()
+requireSuperadmin cfg here action =
+  requireUser (configDb cfg) here $ \u ->
+    if isSuperadmin cfg u then action u else notFoundResponse
+
+-- An account by its number, or else by its email, with whether it's blocked and the mosques it maintains.
+findAccount :: Connection -> Text -> IO (Maybe (User, Bool, [Mosque]))
+findAccount conn q = do
+  account <- case decimal q of
+    Right (n, rest) | T.null rest -> userById conn (UserId n)
+    _                             -> maybe (return Nothing) (userByEmail conn) (normaliseEmail q)
+  case account of
+    Nothing -> return Nothing
+    Just (u, blocked) -> do
+      maintained <- maintainedMosques conn (userId u)
+      return (Just (u, blocked, maintained))
+
+-- Blocking or unblocking, then back to the account; the superadmin's own account
+-- and deleted ones are left as they are, and nothing is logged for them.
+changeBlock :: Config -> Bool -> Text -> ActionM ()
+changeBlock cfg block idText =
+  requireSuperadmin cfg "/admin/users" $ \admin ->
+    case decimal idText of
+      Right (n, rest) | T.null rest -> do
+        let uid = UserId n
+        account <- liftIO $ withDb (configDb cfg) $ \conn -> userById conn uid
+        case account of
+          Just (u, blocked)
+            | not (isSuperadmin cfg u), not (isDeleted u), blocked /= block -> do
+                now <- liftIO getCurrentTime
+                liftIO $ withDb (configDb cfg) $ \conn ->
+                  if block then blockUser conn uid else unblockUser conn uid
+                liftIO $ configLogEdit cfg (blockLogLine now (userId admin) uid block)
+          _ -> return ()
+        redirect (TL.fromStrict ("/admin/users?q=" <> T.pack (show n)))
+      _ -> notFoundResponse
+
 changeFollow :: FilePath -> FollowAction -> Text -> ActionM ()
 changeFollow dbPath action idText = do
   found <- loadMosque dbPath idText
@@ -497,7 +661,7 @@ changeFollow dbPath action idText = do
               unfollowMosque conn (userId user) (mosqueId m)
         redirect (TL.fromStrict url)
 
-loadMosque :: FilePath -> Text -> ActionM (Maybe (Mosque, [(Prayer, PrayerTime)], Maybe UTCTime))
+loadMosque :: FilePath -> Text -> ActionM (Maybe LoadedMosque)
 loadMosque dbPath idText = case parseMosqueId idText of
   Nothing -> return Nothing
   Just mid -> liftIO $ withDb dbPath $ \conn -> do

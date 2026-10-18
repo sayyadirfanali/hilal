@@ -5,9 +5,10 @@
 .env
 /hilal
 azan/
-backup/
+backups/
 config.mk
 dist-newstyle/
+etc/
 hilal.env
 static/app.gen.css
 vendor/

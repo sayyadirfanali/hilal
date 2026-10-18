@@ -13,7 +13,7 @@ import Data.List (sort, sortOn)
 import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Text.Lazy qualified as TL
 import Data.Time (Day, LocalTime (..), TimeOfDay (..), UTCTime (..), addUTCTime, fromGregorian, getCurrentTime)
 import Data.Time.Zones (utcToLocalTimeTZ)
@@ -43,13 +43,14 @@ import Hilal.Auth
   , sha256
   )
 import Hilal.DB (withDb)
-import Hilal.Edit (MosqueForm (..), ValidMosque (..), changedTimings, editLog, emptyForm, validateForm)
+import Hilal.Edit (MosqueForm (..), ValidMosque (..), blockLogLine, changedTimings, editLog, emptyForm, maintainerLog, validateForm)
 import Hilal.Hijri (HijriDate (..), HijriPart (..), hijriFromDay, hijriParts)
 import Hilal.JSON (followedJson, timingsJson)
 import Hilal.Location (Place (..), distanceMeters, isMosqueName, locatePlace, parsePlace, placeLink, placePin, recoverPlusCode, shortLink, townQueries)
 import Hilal.Migrate (migrate)
 import Hilal.Query
-  ( clearWrongCodes
+  ( blockUser
+  , clearWrongCodes
   , countSentCodes
   , countWrongCodes
   , createMosque
@@ -60,6 +61,7 @@ import Hilal.Query
   , followMosque
   , followedMosques
   , getLastUpdated
+  , getMaintainer
   , getMosque
   , getSessionUser
   , getSignInCode
@@ -68,6 +70,7 @@ import Hilal.Query
   , isBlocked
   , isFollowing
   , killSession
+  , maintainedMosques
   , makeSession
   , mosqueByPlace
   , recordSentCode
@@ -75,12 +78,16 @@ import Hilal.Query
   , saveSignInCode
   , saveTiming
   , searchMosques
+  , setMaintainer
+  , unblockUser
   , unfollowMosque
   , updateMosque
+  , userByEmail
+  , userById
   )
 import Hilal.Time (NextJamaat (..), lookupZone, nextJamaat, nextPrayer, upcomingToday)
 import Hilal.Types
-import Hilal.Views (FollowState (..), clockDigits, clockPeriod, countdown, formatDistance, homePage, mosqueFormPage, mosquePage, mosquesPage, stylesheetPath)
+import Hilal.Views (Editing (..), FollowState (..), clockDigits, clockPeriod, countdown, formatDistance, homePage, mosqueFormPage, mosquePage, mosquesPage, stylesheetPath)
 
 thursday, friday :: Day
 thursday = fromGregorian 2026 10 1
@@ -112,11 +119,14 @@ withTestDb action =
     seed conn
     action conn
 
+superadmin :: Text
+superadmin = "admin@example.com"
+
 testConfig :: FilePath -> Config
 testConfig path = Config
   { configDb            = path
   , configSecureCookies = False
-  , configSuperadmin    = "admin@example.com"
+  , configSuperadmin    = superadmin
   , configSendCode      = \_ _ -> return ()
   , configLogEdit       = \_ -> return ()
   , configDemoCode      = Nothing
@@ -212,23 +222,49 @@ withStateDb action = do
   db <- stateDb <$> getState
   liftIO (withDb db action)
 
-signIn :: WaiSession TestState ByteString
-signIn = do
-  _ <- postForm "/sign-in" [] "email=reader%40example.com"
+-- Signs in through the app's own pages, and returns the session cookie.
+-- The test session keeps the last cookie it was given and sends it with every request,
+-- so whoever signed in last is who the app sees: a test acting as two people
+-- signs the second one in again before acting as them.
+signInAs :: Text -> WaiSession TestState ByteString
+signInAs email = do
+  _ <- postForm "/sign-in" [] ("email=" <> formValue email)
   codes <- readCodes
-  case lookup "reader@example.com" codes of
+  case lookup email codes of
     Nothing -> do
       liftIO (expectationFailure "no code was sent")
       return ""
     Just code -> do
-      response <- postForm "/sign-in/code" []
-        ("email=reader%40example.com&code=" <> BL.fromStrict (encodeUtf8 code))
+      response <- postForm "/sign-in/code" [] ("email=" <> formValue email <> "&code=" <> formValue code)
       return (maybe "" (BS.takeWhile (\c -> c /= c2w ';')) (lookup "Set-Cookie" (simpleHeaders response)))
 
+signIn :: WaiSession TestState ByteString
+signIn = signInAs "reader@example.com"
+
+signInAdmin :: WaiSession TestState ByteString
+signInAdmin = signInAs superadmin
+
+-- An account's number, as edits.log and the Users page give it.
+accountNumber :: Text -> WaiSession TestState ByteString
+accountNumber email = do
+  found <- withStateDb (\conn -> userByEmail conn email)
+  case found of
+    Just (User (UserId n) _, _) -> return (encodeUtf8 (T.pack (show n)))
+    Nothing -> do
+      liftIO (expectationFailure "no such account")
+      return ""
+
+-- The superadmin makes reader@example.com the maintainer of Sultan Ahmed Mosque.
+makeReaderMaintainer :: ByteString -> WaiSession TestState ()
+makeReaderMaintainer admin =
+  postForm "/mosques/2/maintainer" [("Cookie", admin)] "email=reader%40example.com"
+    `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/2"] }
+
+pageBody :: ByteString -> ByteString -> WaiSession st ByteString
+pageBody path cookie = BL.toStrict . simpleBody <$> request "GET" path [("Cookie", cookie)] ""
+
 homeBody :: ByteString -> WaiSession st ByteString
-homeBody cookie = do
-  response <- request "GET" "/" [("Cookie", cookie)] ""
-  return (BL.toStrict (simpleBody response))
+homeBody = pageBody "/"
 
 -- The second step of adding Noor Masjid, with its pin placed; the name comes from the link.
 newMosqueBody :: BL.ByteString
@@ -257,6 +293,10 @@ jamaMasjid = Mosque {
 , mosqueLng = 81.3700
 , mosqueTimezone = "Asia/Kolkata"
 }
+
+-- How a mosque's page looks to anyone who may not edit it.
+reporter :: Editing
+reporter = Reporter superadmin
 
 validForm :: MosqueForm
 validForm =
@@ -319,6 +359,13 @@ main = hspec $ do
 
     it "is false when any prayer is missing" $
       hasAllTimings (drop 1 allSix) `shouldBe` False
+
+  describe "isDeleted" $ do
+    it "is true for an account whose email was replaced on deleting it" $
+      isDeleted (User (UserId 12) "deleted:12") `shouldBe` True
+
+    it "is false for any real email" $
+      isDeleted (User (UserId 12) "reader@example.com") `shouldBe` False
 
   describe "nextPrayer" $ do
     it "is Fajr before dawn" $
@@ -579,6 +626,17 @@ main = hspec $ do
       editLog jamaMasjid allSix valid { validTimings = map (\(p, t) -> if p == Asr then (p, timesAt 17) else (p, t)) allSix }
         `shouldBe` ["asr: 16:00/16:15 -> 17:00/17:15"]
 
+  describe "maintainerLog" $ do
+    it "records a new maintainer by account number" $
+      maintainerLog Nothing (Just (UserId 12)) `shouldBe` "maintainer: none -> user=12"
+
+    it "records a maintainer removed" $
+      maintainerLog (Just (UserId 12)) Nothing `shouldBe` "maintainer: user=12 -> none"
+
+  describe "blockLogLine" $
+    it "records who blocked whom, by account number" $
+      blockLogLine noon (UserId 1) (UserId 12) True `shouldBe` "2026-09-30T12:00:00Z user=1 blocked user=12"
+
   describe "checkCode" $ do
     let stored = SignInCode (sha256 "123456") 0 noon later
 
@@ -691,10 +749,10 @@ main = hspec $ do
 
   describe "views" $ do
     it "shows the mosque's name" $
-      renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing Nothing) `shouldSatisfy` TL.isInfixOf "Jama Masjid"
+      renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing Nothing reporter) `shouldSatisfy` TL.isInfixOf "Jama Masjid"
 
     it "escapes names, so admins can't inject HTML" $
-      renderText (mosquePage jamaMasjid { mosqueName = "<b>x</b>" } [] Nothing Nothing Nothing Nothing)
+      renderText (mosquePage jamaMasjid { mosqueName = "<b>x</b>" } [] Nothing Nothing Nothing Nothing reporter)
         `shouldSatisfy` (not . TL.isInfixOf "<b>x</b>")
 
     it "shows morning times in 12-hour format" $
@@ -727,29 +785,53 @@ main = hspec $ do
       html `shouldSatisfy` TL.isInfixOf "id=\"map\""
 
     it "shows the Hijri date under today's date, with the month in Urdu" $ do
-      let html = renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) Nothing Nothing Nothing)
+      let html = renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) Nothing Nothing Nothing reporter)
       html `shouldSatisfy` TL.isInfixOf "19/20 "
       html `shouldSatisfy` TL.isInfixOf "ربیع الثانی"
 
     it "names each prayer in Urdu" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing)
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing reporter)
         `shouldSatisfy` TL.isInfixOf "جمعہ"
 
     it "shows the next prayer" $
-      renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) (Just asrNext) Nothing Nothing)
+      renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) (Just asrNext) Nothing Nothing reporter)
         `shouldSatisfy` TL.isInfixOf "Asr Jamaat"
 
     it "shows how long until the next Jamaat" $
-      renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) (Just asrNext) Nothing Nothing)
+      renderText (mosquePage jamaMasjid allSix (Just (at thursday 14 0)) (Just asrNext) Nothing Nothing reporter)
         `shouldSatisfy` TL.isInfixOf "in 2 h 15 min"
 
     it "shows no next prayer when the local time is unknown" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing)
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing reporter)
         `shouldSatisfy` (not . TL.isInfixOf "Next")
 
     it "has no script when there is nothing to count down" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing)
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing reporter)
         `shouldSatisfy` (not . TL.isInfixOf "<script")
+
+    it "offers to report wrong timings by email, naming the mosque, instead of Edit" $ do
+      let html = renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing reporter)
+      html `shouldSatisfy` TL.isInfixOf "mailto:admin@example.com?subject=Hilal%3A%20mosque%201%2C%20Jama%20Masjid"
+      html `shouldSatisfy` (not . TL.isInfixOf "/mosques/1/edit")
+
+    it "tells the maintainer they maintain the mosque, and offers Edit" $ do
+      let html = renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing Maintainer)
+      html `shouldSatisfy` TL.isInfixOf "You maintain this mosque"
+      html `shouldSatisfy` TL.isInfixOf "/mosques/1/edit"
+      html `shouldSatisfy` (not . TL.isInfixOf "mailto:")
+
+    it "lets the superadmin assign a maintainer" $
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing (Superadmin Nothing []))
+        `shouldSatisfy` TL.isInfixOf "action=\"/mosques/1/maintainer\""
+
+    it "lets the superadmin remove the maintainer" $ do
+      let html = renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing (Superadmin (Just "reader@example.com") []))
+      html `shouldSatisfy` TL.isInfixOf "reader@example.com"
+      html `shouldSatisfy` TL.isInfixOf "/mosques/1/maintainer/remove"
+
+    it "never shows the maintainer to anyone but the superadmin" $
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing Nothing Maintainer)
+        `shouldSatisfy` (not . TL.isInfixOf "/maintainer")
 
     it "escapes values in the mosque form" $
       renderText (mosqueFormPage "Add a mosque" "/mosques/new" [] emptyForm { formName = "<b>x</b>" } [] False)
@@ -759,20 +841,24 @@ main = hspec $ do
       renderText (mosqueFormPage "Add a mosque" "/mosques/new" [] emptyForm { formName = "Noor Masjid" } [] True)
         `shouldSatisfy` (\html -> TL.isInfixOf "Noor Masjid" html && not (TL.isInfixOf "name=\"name\"" html))
 
+    it "warns whoever adds a mosque that they can't change it afterwards" $
+      renderText (mosqueFormPage "Add a mosque" "/mosques/new" [] emptyForm [] True)
+        `shouldSatisfy` TL.isInfixOf "a maintainer they choose"
+
     it "offers to follow a listed mosque" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just NotFollowing))
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just NotFollowing) reporter)
         `shouldSatisfy` TL.isInfixOf "/mosques/1/follow"
 
     it "offers to unfollow a followed mosque" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just Following))
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just Following) reporter)
         `shouldSatisfy` TL.isInfixOf "/mosques/1/unfollow"
 
     it "sends signed-out visitors to sign in before following" $
-      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just SignedOut))
+      renderText (mosquePage jamaMasjid allSix Nothing Nothing Nothing (Just SignedOut) reporter)
         `shouldSatisfy` TL.isInfixOf "/sign-in?next=%2Fmosques%2F1"
 
     it "has no follow button for an unlisted mosque" $
-      renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing Nothing)
+      renderText (mosquePage jamaMasjid [] Nothing Nothing Nothing Nothing reporter)
         `shouldSatisfy` (not . TL.isInfixOf "/follow")
 
     it "invites browsing when nothing is followed" $
@@ -815,6 +901,11 @@ main = hspec $ do
         getMosque conn mid
           `shouldReturn` Just (Mosque mid "Noor Masjid" "Supela, Bhilai" 21.2101 81.3502 "Asia/Kolkata")
 
+    it "adds it without a maintainer" $
+      withTestDb $ \conn -> do
+        mid <- createMosque conn "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" "0x1:0x2" (Coords 21.2101 81.3502)
+        getMaintainer conn mid `shouldReturn` Nothing
+
     it "refuses a second mosque for the same Google Maps place" $
       withTestDb $ \conn -> do
         _ <- createMosque conn "Noor Masjid" "Supela, Bhilai" "Asia/Kolkata" "0x1:0x2" (Coords 21.2101 81.3502)
@@ -837,6 +928,42 @@ main = hspec $ do
         updateMosque conn (MosqueId 1) "Jama Masjid Bhilai" "Sector 6, Bhilai" "Asia/Kolkata"
         getMosque conn (MosqueId 1)
           `shouldReturn` Just jamaMasjid { mosqueName = "Jama Masjid Bhilai" }
+
+  describe "maintainers" $ do
+    it "are none until one is set" $
+      withTestDb $ \conn ->
+        getMaintainer conn (MosqueId 1) `shouldReturn` Nothing
+
+    it "can be set and read back" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        setMaintainer conn (MosqueId 1) (Just (userId user))
+        getMaintainer conn (MosqueId 1) `shouldReturn` Just user
+
+    it "can be removed" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        setMaintainer conn (MosqueId 1) (Just (userId user))
+        setMaintainer conn (MosqueId 1) Nothing
+        getMaintainer conn (MosqueId 1) `shouldReturn` Nothing
+
+    it "belong only to their own mosque" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        setMaintainer conn (MosqueId 1) (Just (userId user))
+        getMaintainer conn (MosqueId 2) `shouldReturn` Nothing
+
+    it "list the mosques they maintain, by name" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        setMaintainer conn (MosqueId 2) (Just (userId user))
+        setMaintainer conn (MosqueId 3) (Just (userId user))
+        map mosqueName <$> maintainedMosques conn (userId user)
+          `shouldReturn` ["Istiqlal Mosque", "Sultan Ahmed Mosque"]
+
+    it "must be real accounts" $
+      withTestDb $ \conn ->
+        setMaintainer conn (MosqueId 1) (Just (UserId 99)) `shouldThrow` anyException
 
   describe "timings" $ do
     it "are empty for a mosque that has entered none" $
@@ -1019,14 +1146,50 @@ main = hspec $ do
       withTestDb $ \conn ->
         isBlocked conn "nobody@example.com" `shouldReturn` False
 
-    it "lose their sessions, follows and email when deleted" $
+    it "can be found by email, with whether they're blocked" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        userByEmail conn "reader@example.com" `shouldReturn` Just (user, False)
+        fmap snd <$> userByEmail conn "blocked@example.com" `shouldReturn` Just True
+
+    it "can be found by number" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        userById conn (userId user) `shouldReturn` Just (user, False)
+
+    it "are nothing when no account matches" $
+      withTestDb $ \conn -> do
+        userByEmail conn "nobody@example.com" `shouldReturn` Nothing
+        userById conn (UserId 99) `shouldReturn` Nothing
+
+    it "lose their sessions and the mosques they maintain when blocked" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        makeSession conn noon later (userId user) "token-hash"
+        setMaintainer conn (MosqueId 2) (Just (userId user))
+        blockUser conn (userId user)
+        isBlocked conn "reader@example.com" `shouldReturn` True
+        getMaintainer conn (MosqueId 2) `shouldReturn` Nothing
+        unblockUser conn (userId user)
+        getSessionUser conn noon "token-hash" `shouldReturn` Nothing
+
+    it "can sign in again once unblocked" $
+      withTestDb $ \conn -> do
+        user <- findOrCreateUser conn noon "reader@example.com"
+        blockUser conn (userId user)
+        unblockUser conn (userId user)
+        isBlocked conn "reader@example.com" `shouldReturn` False
+
+    it "lose their sessions, follows, maintaining and email when deleted" $
       withTestDb $ \conn -> do
         user <- findOrCreateUser conn noon "reader@example.com"
         makeSession conn noon later (userId user) "token-hash"
         followMosque conn noon (userId user) (MosqueId 2)
+        setMaintainer conn (MosqueId 2) (Just (userId user))
         deleteUser conn (userId user) "reader@example.com"
         getSessionUser conn noon "token-hash" `shouldReturn` Nothing
         followedMosques conn (userId user) `shouldReturn` []
+        getMaintainer conn (MosqueId 2) `shouldReturn` Nothing
         let UserId n = userId user
         isBlocked conn ("deleted:" <> T.pack (show n)) `shouldReturn` True
 
@@ -1137,6 +1300,12 @@ main = hspec $ do
     describe "GET /mosques/:id" $ do
       it "shows an existing mosque" $
         get "/mosques/1" `shouldRespondWith` 200
+
+      it "offers signed-out visitors Report, not Edit" $ do
+        body <- bodyOf "/mosques/2"
+        liftIO $ do
+          body `shouldSatisfy` BS.isInfixOf "mailto:admin@example.com"
+          body `shouldSatisfy` (not . BS.isInfixOf "/mosques/2/edit")
 
       it "is 404 for a missing mosque" $
         get "/mosques/99" `shouldRespondWith` 404
@@ -1310,6 +1479,24 @@ main = hspec $ do
         cookie <- signIn
         request "GET" "/account" [("Cookie", cookie)] "" `shouldRespondWith` 200
 
+      it "lists the mosques you maintain" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        makeReaderMaintainer admin
+        reader <- signIn
+        body <- pageBody "/account" reader
+        liftIO (body `shouldSatisfy` BS.isInfixOf "Sultan Ahmed Mosque")
+
+      it "links the superadmin to the Users page" $ do
+        admin <- signInAdmin
+        body <- pageBody "/account" admin
+        liftIO (body `shouldSatisfy` BS.isInfixOf "/admin/users")
+
+      it "doesn't link anyone else to it" $ do
+        reader <- signIn
+        body <- pageBody "/account" reader
+        liftIO (body `shouldSatisfy` (not . BS.isInfixOf "/admin/users"))
+
     describe "deleting your account" $ do
       it "asks you to sign in first, then returns" $
         get "/account/delete" `shouldRespondWith` 302
@@ -1398,6 +1585,11 @@ main = hspec $ do
         logLines <- readLog
         liftIO (logLines `shouldSatisfy` any (T.isInfixOf "created"))
 
+      it "doesn't let whoever added it edit it afterwards" $ do
+        cookie <- signIn
+        postForm "/mosques/new" [("Cookie", cookie)] newMosqueBody `shouldRespondWith` 302
+        request "GET" "/mosques/5/edit" [("Cookie", cookie)] "" `shouldRespondWith` 403
+
       it "takes the name from Google Maps, not from the form" $ do
         cookie <- signIn
         postForm "/mosques/new" [("Cookie", cookie)] (newMosqueBody <> "&name=Shri+Ram+Mandir")
@@ -1441,26 +1633,183 @@ main = hspec $ do
           `shouldRespondWith` 400
 
     describe "editing a mosque" $ do
-      it "shows the form when signed in" $ do
+      it "asks you to sign in first" $
+        get "/mosques/2/edit" `shouldRespondWith` 302
+          { matchHeaders = ["Location" <:> "/sign-in?next=%2Fmosques%2F2%2Fedit"] }
+
+      it "shows the form to the superadmin" $ do
+        admin <- signInAdmin
+        request "GET" "/mosques/2/edit" [("Cookie", admin)] "" `shouldRespondWith` 200
+
+      it "is refused to anyone else" $ do
         cookie <- signIn
-        request "GET" "/mosques/2/edit" [("Cookie", cookie)] "" `shouldRespondWith` 200
+        request "GET" "/mosques/2/edit" [("Cookie", cookie)] "" `shouldRespondWith` 403
+
+      it "won't save for anyone else" $ do
+        cookie <- signIn
+        postForm "/mosques/2/edit" [("Cookie", cookie)] editMosqueBody `shouldRespondWith` 403
+        logLines <- readLog
+        liftIO (logLines `shouldBe` [])
+
+      it "is allowed to the mosque's maintainer" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        makeReaderMaintainer admin
+        reader <- signIn
+        request "GET" "/mosques/2/edit" [("Cookie", reader)] "" `shouldRespondWith` 200
+        postForm "/mosques/2/edit" [("Cookie", reader)] editMosqueBody
+          `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/2"] }
+
+      it "is allowed to a maintainer only for their own mosque" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        makeReaderMaintainer admin
+        reader <- signIn
+        request "GET" "/mosques/3/edit" [("Cookie", reader)] "" `shouldRespondWith` 403
 
       it "is 404 for a missing mosque" $
         get "/mosques/99/edit" `shouldRespondWith` 404
 
       it "saves and logs only what changed" $ do
-        cookie <- signIn
-        postForm "/mosques/2/edit" [("Cookie", cookie)] editMosqueBody
+        admin <- signInAdmin
+        postForm "/mosques/2/edit" [("Cookie", admin)] editMosqueBody
           `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/2"] }
         logLines <- readLog
         liftIO (map (T.isInfixOf "asr: 16:00/16:15 -> 16:00/16:30") logLines `shouldBe` [True])
 
       it "keeps the name from Google Maps" $ do
-        cookie <- signIn
-        postForm "/mosques/2/edit" [("Cookie", cookie)] ("name=Shri+Ram+Mandir&" <> editTimingsBody)
+        admin <- signInAdmin
+        postForm "/mosques/2/edit" [("Cookie", admin)] ("name=Shri+Ram+Mandir&" <> editTimingsBody)
           `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/2"] }
         logLines <- readLog
         liftIO (logLines `shouldSatisfy` (not . any (T.isInfixOf "name:")))
+
+    describe "maintainers" $ do
+      it "are assigned by the superadmin, and logged by account number" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        makeReaderMaintainer admin
+        number <- accountNumber "reader@example.com"
+        logLines <- readLog
+        liftIO (logLines `shouldSatisfy` any (T.isInfixOf ("mosque=2 maintainer: none -> user=" <> decodeUtf8 number)))
+        body <- pageBody "/mosques/2" admin
+        liftIO (body `shouldSatisfy` BS.isInfixOf "reader@example.com")
+
+      it "can't be assigned by anyone else" $ do
+        reader <- signIn
+        postForm "/mosques/2/maintainer" [("Cookie", reader)] "email=reader%40example.com"
+          `shouldRespondWith` 404
+
+      it "must have signed in at least once" $ do
+        admin <- signInAdmin
+        postForm "/mosques/2/maintainer" [("Cookie", admin)] "email=nobody%40example.com"
+          `shouldRespondWith` 400
+
+      it "can't be blocked accounts" $ do
+        admin <- signInAdmin
+        postForm "/mosques/2/maintainer" [("Cookie", admin)] "email=blocked%40example.com"
+          `shouldRespondWith` 400
+
+      it "can't be the superadmin" $ do
+        admin <- signInAdmin
+        postForm "/mosques/2/maintainer" [("Cookie", admin)] "email=admin%40example.com"
+          `shouldRespondWith` 400
+
+      it "can be removed, which stops them editing" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        makeReaderMaintainer admin
+        postForm "/mosques/2/maintainer/remove" [("Cookie", admin)] ""
+          `shouldRespondWith` 302 { matchHeaders = ["Location" <:> "/mosques/2"] }
+        reader <- signIn
+        request "GET" "/mosques/2/edit" [("Cookie", reader)] "" `shouldRespondWith` 403
+        logLines <- readLog
+        liftIO (logLines `shouldSatisfy` any (T.isInfixOf "-> none"))
+
+      it "see that they maintain the mosque" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        makeReaderMaintainer admin
+        reader <- signIn
+        body <- pageBody "/mosques/2" reader
+        liftIO $ do
+          body `shouldSatisfy` BS.isInfixOf "You maintain this mosque"
+          body `shouldSatisfy` (not . BS.isInfixOf "reader@example.com")
+
+    describe "the Users page" $ do
+      it "asks you to sign in first" $
+        get "/admin/users" `shouldRespondWith` 302
+          { matchHeaders = ["Location" <:> "/sign-in?next=%2Fadmin%2Fusers"] }
+
+      it "doesn't exist for anyone but the superadmin" $ do
+        reader <- signIn
+        request "GET" "/admin/users" [("Cookie", reader)] "" `shouldRespondWith` 404
+
+      it "finds an account by email" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        body <- pageBody "/admin/users?q=reader%40example.com" admin
+        liftIO $ do
+          body `shouldSatisfy` BS.isInfixOf "reader@example.com"
+          body `shouldSatisfy` BS.isInfixOf "/block\""
+
+      it "finds an account by number" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        number <- accountNumber "reader@example.com"
+        body <- pageBody ("/admin/users?q=" <> number) admin
+        liftIO (body `shouldSatisfy` BS.isInfixOf "reader@example.com")
+
+      it "says when no account matches" $ do
+        admin <- signInAdmin
+        body <- pageBody "/admin/users?q=nobody%40example.com" admin
+        liftIO (body `shouldSatisfy` BS.isInfixOf "No account matches")
+
+      -- That blocking ends the account's sessions is tested with blockUser above,
+      -- because this session can't send the reader's cookie once the superadmin has signed in.
+      it "blocks an account, so it can't sign in, and removes it as maintainer" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        makeReaderMaintainer admin
+        number <- accountNumber "reader@example.com"
+        postForm ("/admin/users/" <> number <> "/block") [("Cookie", admin)] ""
+          `shouldRespondWith` 302 { matchHeaders = ["Location" <:> ("/admin/users?q=" <> number)] }
+        postForm "/sign-in" [] "email=reader%40example.com" `shouldRespondWith` 403
+        maintainer <- withStateDb (\conn -> getMaintainer conn (MosqueId 2))
+        liftIO (maintainer `shouldBe` Nothing)
+        logLines <- readLog
+        liftIO (logLines `shouldSatisfy` any (T.isInfixOf "blocked user="))
+
+      it "unblocks an account, which can then sign in again" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        number <- accountNumber "reader@example.com"
+        postForm ("/admin/users/" <> number <> "/block") [("Cookie", admin)] "" `shouldRespondWith` 302
+        postForm ("/admin/users/" <> number <> "/unblock") [("Cookie", admin)] "" `shouldRespondWith` 302
+        cookie <- signIn
+        liftIO (cookie `shouldSatisfy` BS.isPrefixOf "hilal_session=")
+
+      it "never blocks the superadmin" $ do
+        admin <- signInAdmin
+        number <- accountNumber superadmin
+        postForm ("/admin/users/" <> number <> "/block") [("Cookie", admin)] "" `shouldRespondWith` 302
+        request "GET" "/account" [("Cookie", admin)] "" `shouldRespondWith` 200
+
+      it "never unblocks a deleted account" $ do
+        reader <- signIn
+        number <- accountNumber "reader@example.com"
+        postForm "/account/delete" [("Cookie", reader)] "" `shouldRespondWith` 200
+        admin <- signInAdmin
+        postForm ("/admin/users/" <> number <> "/unblock") [("Cookie", admin)] "" `shouldRespondWith` 302
+        logLines <- readLog
+        liftIO (logLines `shouldSatisfy` (not . any (T.isInfixOf "unblocked")))
+
+      it "can't be used to block from another site" $ do
+        _ <- signIn
+        admin <- signInAdmin
+        number <- accountNumber "reader@example.com"
+        postForm ("/admin/users/" <> number <> "/block") [("Cookie", admin), ("Origin", "https://evil.example"), ("Host", "localhost")] ""
+          `shouldRespondWith` 403
 
     describe "following" $ do
       it "asks you to sign in first, then returns to the mosque" $

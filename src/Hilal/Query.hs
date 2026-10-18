@@ -7,6 +7,9 @@ module Hilal.Query
   , createMosque
   , mosqueByPlace
   , updateMosque
+  , getMaintainer
+  , setMaintainer
+  , maintainedMosques
   , saveSignInCode
   , getSignInCode
   , incrementCodeAttempts
@@ -19,6 +22,10 @@ module Hilal.Query
   , deleteExpired
   , findOrCreateUser
   , isBlocked
+  , userByEmail
+  , userById
+  , blockUser
+  , unblockUser
   , makeSession
   , getSessionUser
   , killSession
@@ -96,6 +103,7 @@ getLastUpdated conn mid = do
     _               -> Nothing
 
 -- Fails if a mosque with the same Google Maps place already exists.
+-- A new mosque has no maintainer: whoever adds it doesn't become one.
 createMosque :: Connection -> Text -> Text -> Text -> Text -> Coords -> IO MosqueId
 createMosque conn name address timezone place (Coords lat lng) = do
   execute conn
@@ -116,6 +124,31 @@ updateMosque conn mid name address timezone =
   execute conn
     "UPDATE mosques SET name = ?, address = ?, timezone = ? WHERE id = ?"
     (name, address, timezone, mid)
+
+-- The one person besides the superadmin who may edit the mosque, if it has one.
+getMaintainer :: Connection -> MosqueId -> IO (Maybe User)
+getMaintainer conn mid = do
+  rows <- query conn
+    "SELECT users.id, users.email FROM mosques \
+    \JOIN users ON users.id = mosques.maintainer_id \
+    \WHERE mosques.id = ?"
+    (Only mid)
+  return $ case rows of
+    [u] -> Just u
+    _   -> Nothing
+
+-- Nothing removes the maintainer.
+setMaintainer :: Connection -> MosqueId -> Maybe UserId -> IO ()
+setMaintainer conn mid uid =
+  execute conn "UPDATE mosques SET maintainer_id = ? WHERE id = ?" (uid, mid)
+
+maintainedMosques :: Connection -> UserId -> IO [Mosque]
+maintainedMosques conn uid =
+  query conn
+    "SELECT id, name, address, lat, lng, timezone FROM mosques \
+    \WHERE maintainer_id = ? \
+    \ORDER BY name COLLATE NOCASE"
+    (Only uid)
 
 saveSignInCode :: Connection -> UTCTime -> UTCTime -> Text -> Text -> IO ()
 saveSignInCode conn now expires email hashed =
@@ -208,6 +241,32 @@ isBlocked conn email = do
     [Only b] -> b /= (0 :: Int)
     _        -> False
 
+-- An account and whether it is blocked, for the superadmin's Users page.
+userByEmail :: Connection -> Text -> IO (Maybe (User, Bool))
+userByEmail conn email =
+  accountFrom <$> query conn "SELECT id, email, blocked FROM users WHERE email = ?" (Only email)
+
+userById :: Connection -> UserId -> IO (Maybe (User, Bool))
+userById conn uid =
+  accountFrom <$> query conn "SELECT id, email, blocked FROM users WHERE id = ?" (Only uid)
+
+accountFrom :: [User :. Only Int] -> Maybe (User, Bool)
+accountFrom rows = case rows of
+  [u :. Only b] -> Just (u, b /= 0)
+  _             -> Nothing
+
+-- A blocked account is signed out everywhere and stops maintaining any mosque.
+blockUser :: Connection -> UserId -> IO ()
+blockUser conn uid = withTransaction conn $ do
+  execute conn "UPDATE users SET blocked = 1 WHERE id = ?" (Only uid)
+  execute conn "DELETE FROM sessions WHERE user_id = ?" (Only uid)
+  execute conn "UPDATE mosques SET maintainer_id = NULL WHERE maintainer_id = ?" (Only uid)
+
+-- Unblocking doesn't make anyone a maintainer again.
+unblockUser :: Connection -> UserId -> IO ()
+unblockUser conn uid =
+  execute conn "UPDATE users SET blocked = 0 WHERE id = ?" (Only uid)
+
 makeSession :: Connection -> UTCTime -> UTCTime -> UserId -> Text -> IO ()
 makeSession conn now expires uid tokenHash =
   execute conn
@@ -229,7 +288,8 @@ killSession :: Connection -> Text -> IO ()
 killSession conn tokenHash =
   execute conn "DELETE FROM sessions WHERE token_hash = ?" (Only tokenHash)
 
--- Deletes an account: its sessions, follows and any pending code go, and its email is replaced.
+-- Deletes an account: its sessions, follows, any pending code and any mosque it maintains go,
+-- and its email is replaced.
 -- The row itself stays, blocked, so its id is never given to anyone else, since edits.log names users by id;
 -- "deleted:12" can't be signed in with, because an email needs an @.
 deleteUser :: Connection -> UserId -> Text -> IO ()
@@ -237,6 +297,7 @@ deleteUser conn uid email = withTransaction conn $ do
   execute conn "DELETE FROM sessions WHERE user_id = ?" (Only uid)
   execute conn "DELETE FROM follows WHERE user_id = ?" (Only uid)
   execute conn "DELETE FROM sign_in_codes WHERE email = ?" (Only email)
+  execute conn "UPDATE mosques SET maintainer_id = NULL WHERE maintainer_id = ?" (Only uid)
   execute conn "UPDATE users SET email = 'deleted:' || id, blocked = 1 WHERE id = ?" (Only uid)
 
 followMosque :: Connection -> UTCTime -> UserId -> MosqueId -> IO ()
